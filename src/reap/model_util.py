@@ -1,3 +1,6 @@
+import pathlib
+import shutil
+
 import torch
 import logging
 
@@ -115,12 +118,123 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "DeepseekV3ForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
+    "KimiK25ForConditionalGeneration": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+        "decoder_root": "language_model.model.layers",
+        "config_root": "text_config",
+    },
 }
+
+
+def _resolve_attr_path(root, dotted_path):
+    obj = root
+    for part in dotted_path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def get_decoder_layers(model):
+    """Return the ModuleList of decoder layers, accounting for multimodal wrappers."""
+    model_attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    decoder_root = model_attrs.get("decoder_root", "model.layers") if model_attrs else "model.layers"
+    return _resolve_attr_path(model, decoder_root)
+
+
+def get_text_config(model):
+    """Return the config object that holds n_routed_experts / num_experts_per_tok."""
+    model_attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    if model_attrs and "config_root" in model_attrs:
+        return _resolve_attr_path(model.config, model_attrs["config_root"])
+    return model.config
 
 
 def get_moe(model, layer):
     moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    return getattr(get_decoder_layers(model)[layer], moe_attr_name)
+
+
+def maybe_override_vision_attn_impl(model_name, enable_text_flash_attn=False):
+    """Return a patched config that adjusts attn_implementation for K2.5-style wrappers.
+
+    Returns None when no override is needed.
+
+    * If ``flash_attn`` is missing, downgrade ``vision_config._attn_implementation``
+      from ``flash_attention_2`` to ``sdpa`` so the wrapper's __init__ doesn't
+      explode trying to import flash_attn. The vision tower is unused during
+      MoE expert pruning anyway.
+
+    * If ``enable_text_flash_attn=True`` AND ``flash_attn`` is importable, also
+      flip ``text_config._attn_implementation`` to ``"flash_attention_2"``. This
+      avoids the manual softmax's ``[bs, heads, q, k]`` tensor materialization
+      and is useful for the ``prune.py`` full-forward path. **Do not enable for
+      ``layerwise_prune.py``**: the layerwise replay cache's attention_mask
+      handling does not align cleanly with flash_attn's ``_upad_input`` and
+      causes CUDA OOB asserts inside ``index_first_axis``.
+    """
+    from transformers import AutoConfig
+
+    try:
+        import flash_attn  # noqa: F401
+        flash_attn_available = True
+    except ImportError:
+        flash_attn_available = False
+
+    try:
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except Exception as e:
+        logger.warning("Could not preload config for attn override: %s", e)
+        return None
+
+    text_config = getattr(config, "text_config", None)
+    vision_config = getattr(config, "vision_config", None)
+    changed = False
+
+    if flash_attn_available and enable_text_flash_attn:
+        if (
+            text_config is not None
+            and getattr(text_config, "_attn_implementation", None)
+            != "flash_attention_2"
+        ):
+            text_config._attn_implementation = "flash_attention_2"
+            changed = True
+            logger.info(
+                "flash_attn available; enabling flash_attention_2 on text_config "
+                "(skips materializing the full attention softmax tensor)."
+            )
+
+    if not flash_attn_available and vision_config is not None:
+        if (
+            getattr(vision_config, "_attn_implementation", None)
+            == "flash_attention_2"
+        ):
+            vision_config._attn_implementation = "sdpa"
+            changed = True
+            logger.warning(
+                "flash_attn not installed; overriding vision_tower "
+                "_attn_implementation to 'sdpa'. The vision tower is unused "
+                "during MoE expert pruning."
+            )
+
+    return config if changed else None
 
 
 def assert_merge(model, merged_moe, cluster_label):
@@ -261,6 +375,34 @@ def get_super_expert_indices(observer_data, include_last_layers: bool = False):
     super_expert_idx = torch.argwhere(super_experts_mask)
     logger.info(f"Identified {super_experts_mask.sum().item()} super experts with threshold: {final_threshold:.4f}")
     return super_expert_idx
+
+def save_processor_and_aux_files(model_name: str, pruned_model_dir: pathlib.Path) -> None:
+    """Persist files that `model.save_pretrained` + `tokenizer.save_pretrained` miss.
+
+    Multimodal models (e.g. Kimi-K2.5) ship a `preprocessor_config.json` plus
+    custom vision-processor Python files that only get written when
+    `AutoProcessor.save_pretrained` is called. And any helper modules
+    transitively imported by registered classes (e.g. `media_utils.py`) aren't
+    in any `auto_map`, so they're never copied automatically — vLLM then fails
+    to import the custom processor/tokenizer at load time.
+    """
+    from transformers import AutoProcessor
+
+    try:
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        processor.save_pretrained(pruned_model_dir)
+        logger.info(f"Saved processor to {pruned_model_dir}")
+    except Exception as e:
+        logger.debug(f"No processor for {model_name} (likely text-only): {e}")
+
+    source_dir = pathlib.Path(model_name)
+    if source_dir.is_dir():
+        for py_file in source_dir.glob("*.py"):
+            dest = pruned_model_dir / py_file.name
+            if not dest.exists():
+                shutil.copy2(py_file, dest)
+                logger.info(f"Copied auxiliary file {py_file.name} to {pruned_model_dir}")
+
 
 def register_llama_with_vllm():
     from vllm.model_executor.models import ModelRegistry

@@ -17,11 +17,14 @@ token or a prompt-completion dataset for training on completions only with SFTTr
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
 import uuid
 import json
 import re
 import random
 import logging
+
+_MAP_NUM_PROC = min(os.cpu_count() or 1, 16)
 
 
 import torch
@@ -374,7 +377,9 @@ class BaseDatasetProcessor(ABC):
     ) -> dict[str, list[TokensPrompt]] | dict[str, list[BatchEncoding]]:
         """Get requests for each category in the dataset."""
         if self._mapped_dataset is None:
-            self._mapped_dataset = self.dataset.map(self._map_fn)
+            self._mapped_dataset = self.dataset.map(
+                self._map_fn, num_proc=_MAP_NUM_PROC
+            )
         if self.split_by_category:
             categories = (
                 self.categories
@@ -482,7 +487,7 @@ class BaseDatasetProcessor(ABC):
         category_dataset: Dataset,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         processed_samples = []
-        sampled = []  # sample without replacement
+        sampled: set[int] = set()  # sample without replacement (O(1) membership)
         current_batch = []
         while len(processed_samples) < batches_per_category:
             if len(sampled) >= len(category_dataset):
@@ -495,7 +500,7 @@ class BaseDatasetProcessor(ABC):
             sample_idx = random.randint(0, len(category_dataset) - 1)
             if sample_idx in sampled:
                 continue
-            sampled.append(sample_idx)
+            sampled.add(sample_idx)
             sample = category_dataset[sample_idx]
             encoded_sample = self._encode_sample(sample)
             if encoded_sample.shape[-1] > self.max_input_len:
@@ -533,7 +538,7 @@ class BaseDatasetProcessor(ABC):
         category_dataset: Dataset,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         processed_samples = []
-        sampled = []
+        sampled: set[int] = set()  # sample without replacement (O(1) membership)
         current_batch = []
         while len(processed_samples) < batches_per_category:
             if len(sampled) >= len(category_dataset):
@@ -555,7 +560,7 @@ class BaseDatasetProcessor(ABC):
                 sample_idx = random.randint(0, len(category_dataset) - 1)
                 if sample_idx in sampled:
                     continue
-                sampled.append(sample_idx)
+                sampled.add(sample_idx)
                 sample = category_dataset[sample_idx]
                 encoded_sample = self._encode_sample(sample)  # shape (batch, seq)
                 end_seq = seq_idx + encoded_sample.shape[-1]
@@ -628,9 +633,11 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
             return {"text": chat_sample}
 
         if self._mapped_dataset is None:
-            self._mapped_dataset = self.dataset.map(self._map_fn)
+            self._mapped_dataset = self.dataset.map(
+                self._map_fn, num_proc=_MAP_NUM_PROC
+            )
 
-        return self._mapped_dataset.map(chat_template_fn)
+        return self._mapped_dataset.map(chat_template_fn, num_proc=_MAP_NUM_PROC)
 
 
 class LMDatasetProcessor(BaseDatasetProcessor):
@@ -646,7 +653,9 @@ class LMDatasetProcessor(BaseDatasetProcessor):
         """Get the mapped dataset without tokenization applied."""
 
         if self._mapped_dataset is None:
-            self._mapped_dataset = self.dataset.map(self._map_fn)
+            self._mapped_dataset = self.dataset.map(
+                self._map_fn, num_proc=_MAP_NUM_PROC
+            )
 
         return self._mapped_dataset
 

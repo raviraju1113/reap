@@ -33,8 +33,8 @@ run_math=${10:-false}
 run_wildbench=${11:-false}
 singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
-num_batches=128
-batch_size=8
+num_batches=1
+batch_size=32
 output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 
@@ -59,31 +59,33 @@ python -m reap.layerwise_prune \
     --output_file_name ${output_file_name} \
     --batches_per_category ${num_batches} \
     --batch_size ${batch_size} \
-    --low_cpu_mem_usage True
+    --save_intermediate True \
+    --low_cpu_mem_usage True \
+    --record_pruning_metrics_only true
 
-short_model_name=$(artifact_dir_name "$model_name")
-short_dataset_name=$(artifact_dir_name "$dataset_name")
+# short_model_name=$(artifact_dir_name "$model_name")
+# short_dataset_name=$(artifact_dir_name "$dataset_name")
 
-pruned_model_dir_name="layerwise_${pruning_method}"
-if [[ "${singleton_super_experts}" == "true" ]]; then
-    pruned_model_dir_name="${pruned_model_dir_name}-perserve_super"
-elif [[ "${singleton_outlier_experts}" == "true" ]]; then
-    pruned_model_dir_name="${pruned_model_dir_name}-perserve_outlier"
-fi
-pruned_model_dir_name="${pruned_model_dir_name}-renorm_true"
-pruned_model_dir_name="${pruned_model_dir_name}-seed_${seed}-${compression_ratio}"
+# pruned_model_dir_name="layerwise_${pruning_method}"
+# if [[ "${singleton_super_experts}" == "true" ]]; then
+#     pruned_model_dir_name="${pruned_model_dir_name}-perserve_super"
+# elif [[ "${singleton_outlier_experts}" == "true" ]]; then
+#     pruned_model_dir_name="${pruned_model_dir_name}-perserve_outlier"
+# fi
+# pruned_model_dir_name="${pruned_model_dir_name}-renorm_true"
+# pruned_model_dir_name="${pruned_model_dir_name}-seed_${seed}-${compression_ratio}"
 
-model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruned_model_dir_name}"
+# model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruned_model_dir_name}"
 
-echo "evaluating model: ${model_dir}"
-bash experiments/eval.sh \
-    $model_dir \
-    $seed\
-    $port \
-    $server_log_file_name \
-    ${run_lm_eval} \
-    ${run_evalplus} \
-    ${run_livecodebench} \
-    ${run_math} \
-    ${run_wildbench}
-echo "Finished evaluating model: ${model_dir}"
+# echo "evaluating model: ${model_dir}"
+# bash experiments/eval.sh \
+#     $model_dir \
+#     $seed\
+#     $port \
+#     $server_log_file_name \
+#     ${run_lm_eval} \
+#     ${run_evalplus} \
+#     ${run_livecodebench} \
+#     ${run_math} \
+#     ${run_wildbench}
+# echo "Finished evaluating model: ${model_dir}"

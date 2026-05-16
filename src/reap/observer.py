@@ -20,7 +20,11 @@ from reap.metrics import (
     OnlineStatsTracker,
     get_distance_fn,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.pruning_metrics import (
+    initialize_pruning_state,
+    update_pruning_state,
+    update_pruning_state_streaming,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -328,7 +332,14 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
-            if not len(output) >= 2:
+            # Some patched MoE blocks (e.g. DeepSeek-V3 / Kimi-K2.5) keep
+            # returning a single hidden-state tensor so the decoder layer's
+            # ``hidden_states = self.mlp(hidden_states)`` doesn't break, and
+            # surface router_logits via a side-channel attribute set in the
+            # patched forward. Detect that here and fall back to tuple-unpack
+            # only for models that genuinely return ``(output, ..., router_logits)``.
+            output_is_tensor = torch.is_tensor(output)
+            if not output_is_tensor and not len(output) >= 2:
                 raise ValueError(
                     f"Expected output of module {module.__class__.__name__} at layer "
                     f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
@@ -348,7 +359,27 @@ class MoETransformerObserver(BaseTransformerObserver):
                 # No mask provided - treat all tokens as valid
                 flat_mask = None
 
-            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
+            # Streaming-per-expert path: skip the dense [num_experts, tokens,
+            # hidden] allocation entirely when only pruning metrics are needed.
+            # Required for K2.5-scale MoEs (384 experts) where the dense tensor
+            # plus its valid-token-mask copy overrun even bf16 budgets.
+            streaming = (
+                self.hook_config.record_pruning_metrics_only
+                and not self.hook_config.fused_experts
+                and hasattr(module, "experts")
+            )
+
+            # Allocate per-expert outputs in the model dtype (bf16 for K2.5).
+            # Default fp32 doubles memory and triggers OOM on large MoEs.
+            activations = (
+                None
+                if streaming
+                else torch.zeros(
+                    (num_experts, *flat_input.shape),
+                    device=device,
+                    dtype=flat_input.dtype,
+                )
+            )
 
             if self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
@@ -372,26 +403,49 @@ class MoETransformerObserver(BaseTransformerObserver):
                 activations = routed_out.view(num_experts, *flat_input.shape)
 
             else:  # loop based MoE execution
-                # ernie returns combined_output, combine_weights, router_loss, gate_logits
-                *_, router_logits = output  # (total_tokens, num_experts)
+                if output_is_tensor:
+                    # Side-channel set by the V3 / K2.5 forward patch.
+                    router_logits = getattr(module, "_reap_router_logits", None)
+                    if router_logits is None:
+                        raise RuntimeError(
+                            f"MoE module {module.__class__.__name__} at layer "
+                            f"{layer_number} returned a bare tensor but did not "
+                            f"set _reap_router_logits. Check that patch_deepseek_v3_moe "
+                            f"was applied after model load."
+                        )
+                else:
+                    # ernie returns combined_output, combine_weights, router_loss, gate_logits
+                    *_, router_logits = output  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 # selected_experts = selected_experts.to(device)
-                for idx, expert in enumerate(module.experts):
-                    activations[idx] = expert(flat_input).to(
-                        device
-                    )  # (num_experts, total_seq_len, hidden_dim)
+                if not streaming:
+                    for idx, expert in enumerate(module.experts):
+                        activations[idx] = expert(flat_input).to(
+                            device
+                        )  # (num_experts, total_seq_len, hidden_dim)
 
+            if streaming:
+                pruning_batch = update_pruning_state_streaming(
+                    self.state[layer_number],
+                    flat_input=flat_input,
+                    experts=module.experts,
+                    selected_experts=selected_experts,
+                    router_logits=router_logits,
+                    num_experts=num_experts,
+                    valid_token_mask=flat_mask,
+                    renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                )
+            else:
+                pruning_batch = update_pruning_state(
+                    self.state[layer_number],
+                    activations=activations,
+                    selected_experts=selected_experts,
+                    router_logits=router_logits,
+                    num_experts=num_experts,
+                    valid_token_mask=flat_mask,
+                    renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                )
             del flat_input
-            
-            pruning_batch = update_pruning_state(
-                self.state[layer_number],
-                activations=activations,
-                selected_experts=selected_experts,
-                router_logits=router_logits,
-                num_experts=num_experts,
-                valid_token_mask=flat_mask,
-                renormalize_router_weights=self.hook_config.renormalize_router_weights,
-            )
 
             # Merging critera
             if not self.hook_config.record_pruning_metrics_only:
@@ -465,12 +519,9 @@ class MoETransformerObserver(BaseTransformerObserver):
                 )
 
             # --- CLEAN UP -------------------------------------------------------------
-            del (
-                activations,
-                selected_experts,
-                router_logits,
-                pruning_batch,
-            )
+            del selected_experts, router_logits, pruning_batch
+            if activations is not None:
+                del activations
             gc.collect()
 
         return _hook_fn
@@ -524,12 +575,23 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class DeepseekV3MoEObserverHookConfig(MoETransformerObserverConfig):
+    """Observer config for DeepSeek-V3-style MoE (Kimi-K2 / Kimi-K2.5 / DeepSeek-V3)."""
+    module_class_name_to_hook_regex: Optional[str] = "DeepseekV3MoE"
+    num_experts_attr_name: str = "config.n_routed_experts"
+    top_k_attr_name: str = "num_experts_per_tok"
+    fused_experts: bool = False
+
+
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
     "MixtralForCausalLM": MixtralMoEObserverHookConfig,
     "DeepseekV2ForCausalLM": DeepSeekMoEObserverHookConfig,
+    "DeepseekV3ForCausalLM": DeepseekV3MoEObserverHookConfig,
+    "KimiK25ForConditionalGeneration": DeepseekV3MoEObserverHookConfig,
     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,

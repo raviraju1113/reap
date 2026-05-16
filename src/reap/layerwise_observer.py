@@ -37,7 +37,11 @@ from reap.layerwise_model_utils import (
     safe_get_device,
     has_meta_tensors,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.pruning_metrics import (
+    initialize_pruning_state,
+    update_pruning_state,
+    update_pruning_state_streaming,
+)
 from reap.metrics import OnlineStatsTracker
 
 logging.basicConfig(level=logging.INFO)
@@ -122,6 +126,14 @@ class ReplayCache:
 
         for batch, inputs in zip(self._batches, next_inputs):
             batch.inputs = inputs
+
+    def state_dict(self) -> List[ReplayBatch]:
+        """Return the replay batches for serialization to disk."""
+        return list(self._batches)
+
+    def load_state_dict(self, batches: List[ReplayBatch]) -> None:
+        """Restore replay batches from a previously saved state."""
+        self._batches = list(batches)
 
 
 class LayerwiseMoEObserver:
@@ -634,8 +646,25 @@ class LayerwiseMoEObserver:
         if block_idx not in self.state:
             self.state[block_idx] = self._initialize_block_state(num_experts)
 
-        # Compute activations for all experts
-        activations = torch.zeros((num_experts, *flat_input.shape), device=device)
+        # Pruning-only streaming path: skip the dense [num_experts, tokens, hidden]
+        # activations tensor entirely. Required for K2.5-scale MoEs (384 experts,
+        # 7168 hidden) where the dense allocation can exceed 100 GB per batch.
+        streaming = (
+            self.hook_config.record_pruning_metrics_only
+            and not self.hook_config.fused_experts
+            and hasattr(moe_module, "experts")
+        )
+
+        # Compute activations for all experts (dense path; bypassed when streaming).
+        activations = (
+            None
+            if streaming
+            else torch.zeros(
+                (num_experts, *flat_input.shape),
+                device=device,
+                dtype=flat_input.dtype,
+            )
+        )
 
         # TODO(ivanl): model-specific handling of router_module return signature
         def extract_router_logits(router_module, input):
@@ -693,22 +722,37 @@ class LayerwiseMoEObserver:
 
             _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
 
-            # Compute activations for all experts
-            for idx, expert in enumerate(moe_module.experts):
-                activations[idx] = expert(flat_input).to(device)
+            if not streaming:
+                # Dense path: forward every expert on every token.
+                for idx, expert in enumerate(moe_module.experts):
+                    activations[idx] = expert(flat_input).to(device)
 
-        update_pruning_state(
-            self.state[block_idx],
-            activations=activations,
-            selected_experts=selected_experts,
-            router_logits=router_logits,
-            num_experts=num_experts,
-            valid_token_mask=valid_token_mask,
-            renormalize_router_weights=self.hook_config.renormalize_router_weights,
-        )
+        if streaming:
+            update_pruning_state_streaming(
+                self.state[block_idx],
+                flat_input=flat_input,
+                experts=moe_module.experts,
+                selected_experts=selected_experts,
+                router_logits=router_logits,
+                num_experts=num_experts,
+                valid_token_mask=valid_token_mask,
+                renormalize_router_weights=self.hook_config.renormalize_router_weights,
+            )
+        else:
+            update_pruning_state(
+                self.state[block_idx],
+                activations=activations,
+                selected_experts=selected_experts,
+                router_logits=router_logits,
+                num_experts=num_experts,
+                valid_token_mask=valid_token_mask,
+                renormalize_router_weights=self.hook_config.renormalize_router_weights,
+            )
 
         # Clean up
-        del activations, selected_experts, router_logits
+        del selected_experts, router_logits
+        if activations is not None:
+            del activations
         if valid_token_mask is not None:
             del valid_token_mask
         gc.collect()
@@ -857,6 +901,90 @@ class LayerwiseMoEObserver:
             if moe_hook_handle is not None:
                 moe_hook_handle.remove()
 
+    _REPLAY_CHECKPOINT_NAME = "replay_after_block.pt"
+
+    def _try_resume_from_intermediate(
+        self,
+        save_path: Optional[pathlib.Path],
+    ) -> int:
+        """Load any saved per-block metrics and replay cache; return next block to run.
+
+        Returns 0 when no resumable state is found. When a matched pair of
+        ``block_NNN_metrics.pt`` files and the rolling ``replay_after_block.pt``
+        exists, restores them and returns ``NNN + 1`` so the caller can pick up
+        from the next unprocessed block.
+        """
+        if save_path is None or not save_path.exists():
+            return 0
+
+        replay_path = save_path / self._REPLAY_CHECKPOINT_NAME
+        if not replay_path.exists():
+            return 0
+
+        try:
+            replay_state = torch.load(replay_path, weights_only=False)
+            replay_batches = replay_state["batches"]
+            last_block_idx = int(replay_state["last_block_idx"])
+        except Exception as e:
+            logger.warning(
+                f"Could not load replay checkpoint at {replay_path}: {e}. "
+                "Starting this group from scratch."
+            )
+            return 0
+
+        metric_files = {}
+        for block_idx in range(last_block_idx + 1):
+            metric_path = save_path / f"block_{block_idx:03d}_metrics.pt"
+            if not metric_path.exists():
+                logger.warning(
+                    f"Replay checkpoint claims block {last_block_idx} completed but "
+                    f"{metric_path.name} is missing. Restarting this group."
+                )
+                return 0
+            metric_files[block_idx] = metric_path
+
+        for block_idx, metric_path in metric_files.items():
+            try:
+                loaded = torch.load(metric_path, weights_only=False)
+            except Exception as e:
+                logger.warning(
+                    f"Could not load metrics at {metric_path}: {e}. "
+                    "Restarting this group."
+                )
+                self.state.clear()
+                return 0
+            # Non-MoE blocks (e.g., dense first layers in DeepSeek-V3) save an
+            # empty dict as a completion sentinel. Don't promote those into
+            # self.state — downstream code assumes every state entry has MoE
+            # metrics like `expert_frequency`.
+            if loaded:
+                self.state[block_idx] = loaded
+
+        self.replay_cache.load_state_dict(replay_batches)
+        next_block = last_block_idx + 1
+        logger.info(
+            f"Resuming group from block {next_block} "
+            f"({len(metric_files)} blocks of metrics + replay cache restored from disk)"
+        )
+        return next_block
+
+    def _save_replay_checkpoint(
+        self,
+        save_path: pathlib.Path,
+        last_block_idx: int,
+    ) -> None:
+        """Persist the current replay cache so this group can resume after a crash."""
+        replay_path = save_path / self._REPLAY_CHECKPOINT_NAME
+        tmp_path = replay_path.with_suffix(".pt.tmp")
+        torch.save(
+            {
+                "batches": self.replay_cache.state_dict(),
+                "last_block_idx": last_block_idx,
+            },
+            tmp_path,
+        )
+        tmp_path.replace(replay_path)
+
     @torch.inference_mode()
     def _record_all_blocks_for_batch_group(
         self,
@@ -880,9 +1008,11 @@ class LayerwiseMoEObserver:
             f"Processing {len(self.blocks)} blocks with {len(data_batches)} batches"
         )
 
-        self._capture_first_block_inputs(data_batches)
+        start_block = self._try_resume_from_intermediate(save_path)
+        if start_block == 0:
+            self._capture_first_block_inputs(data_batches)
 
-        for block_idx in range(len(self.blocks)):
+        for block_idx in range(start_block, len(self.blocks)):
             moe_module = self._find_moe_module_in_block(block_idx)
             if moe_module is None:
                 logger.warning(f"No MoE module in block {block_idx}, forwarding only")
@@ -895,6 +1025,10 @@ class LayerwiseMoEObserver:
                 intermediate_path = save_path / f"block_{block_idx:03d}_metrics.pt"
                 intermediate_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(self.state.get(block_idx, {}), intermediate_path)
+                # Save the rolling replay-cache checkpoint so a crash here
+                # can resume from block_idx + 1. Overwrites the prior one
+                # (atomic via tmp + rename) to bound disk usage to one file.
+                self._save_replay_checkpoint(save_path, block_idx)
                 logger.info(f"Saved intermediate results to {intermediate_path}")
 
             cleanup_memory()
@@ -908,6 +1042,15 @@ class LayerwiseMoEObserver:
 
         self.replay_cache.clear()
         cleanup_memory(synchronize=False)
+
+        # Group complete — the replay checkpoint is no longer needed.
+        if save_path is not None:
+            replay_path = save_path / self._REPLAY_CHECKPOINT_NAME
+            if replay_path.exists():
+                try:
+                    replay_path.unlink()
+                except OSError:
+                    pass
 
         logger.info(f"Completed processing all {len(self.blocks)} blocks")
         return self.report_state()
@@ -945,7 +1088,55 @@ class LayerwiseMoEObserver:
             batch_group_size,
         )
 
+        # Cross-group resume: any group whose directory has all 61 block metric
+        # files AND no replay checkpoint is fully complete. The last block-metric
+        # file in that group already encodes the cumulative state through that
+        # group, so we just load it and skip ahead.
+        start_group_idx = 0
+        if save_path is not None:
+            for group_idx in range(total_groups):
+                group_dir = save_path / f"group_{group_idx:03d}"
+                if not group_dir.exists():
+                    break
+                replay_path = group_dir / self._REPLAY_CHECKPOINT_NAME
+                if replay_path.exists():
+                    break  # partial group — let inner resume handle it
+                if not all(
+                    (group_dir / f"block_{b:03d}_metrics.pt").exists()
+                    for b in range(len(self.blocks))
+                ):
+                    break
+                start_group_idx = group_idx + 1
+
+            if start_group_idx > 0:
+                last_complete_dir = save_path / f"group_{start_group_idx - 1:03d}"
+                try:
+                    for block_idx in range(len(self.blocks)):
+                        metric_path = (
+                            last_complete_dir / f"block_{block_idx:03d}_metrics.pt"
+                        )
+                        loaded = torch.load(metric_path, weights_only=False)
+                        if loaded:
+                            self.state[block_idx] = loaded
+                    logger.info(
+                        "Restored cumulative state through group %s; "
+                        "skipping %s completed group(s)",
+                        start_group_idx - 1,
+                        start_group_idx,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Could not restore cumulative state from group %s (%s). "
+                        "Restarting from group 0.",
+                        start_group_idx - 1,
+                        e,
+                    )
+                    self.state.clear()
+                    start_group_idx = 0
+
         for group_idx, start in enumerate(range(0, len(data_batches), batch_group_size)):
+            if group_idx < start_group_idx:
+                continue
             end = min(start + batch_group_size, len(data_batches))
             batch_group = data_batches[start:end]
             group_save_path = save_path

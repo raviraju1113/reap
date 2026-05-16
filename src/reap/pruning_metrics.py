@@ -214,3 +214,118 @@ def update_pruning_state(
     )
 
     return pruning_batch
+
+
+def update_pruning_state_streaming(
+    layer_state: dict[str, Any],
+    *,
+    flat_input: torch.Tensor,
+    experts,
+    selected_experts: torch.Tensor,
+    router_logits: torch.Tensor,
+    num_experts: int,
+    valid_token_mask: Optional[torch.Tensor] = None,
+    renormalize_router_weights: bool = False,
+) -> PreparedPruningBatch:
+    """Memory-efficient equivalent of :func:`update_pruning_state` for the pruning-only state.
+
+    Instead of materializing a dense ``[num_experts, tokens, hidden]`` activations
+    tensor, this forwards each expert exactly once on the subset of tokens routed
+    to it. Peak memory is bounded by the largest single expert's output
+    (``~tokens * top_k / num_experts * hidden``) rather than ``num_experts * tokens * hidden``.
+
+    Required for large MoEs (e.g. Kimi-K2.5: 384 experts × 7168 hidden) where the
+    dense path would allocate hundreds of GB per batch. Numerically equivalent
+    to ``update_pruning_state`` for the pruning saliency metrics it populates.
+    """
+    device = flat_input.device
+    selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1]).to(device)
+    router_logits = router_logits.to(device)
+    flat_input_view = flat_input.reshape(-1, flat_input.shape[-1])
+
+    if valid_token_mask is not None:
+        valid_token_mask = valid_token_mask.reshape(-1).bool().to(device)
+        flat_input_view = flat_input_view[valid_token_mask]
+        selected_experts = selected_experts[valid_token_mask]
+        router_logits = router_logits[valid_token_mask]
+
+    if router_logits.shape[1] != num_experts:
+        raise ValueError(
+            f"Expected router logits for {num_experts} experts, got {router_logits.shape[1]}"
+        )
+    if router_logits.shape[0] != selected_experts.shape[0]:
+        raise ValueError(
+            "Router logits and selected expert token counts do not match: "
+            f"{router_logits.shape[0]} vs {selected_experts.shape[0]}"
+        )
+
+    num_tokens = torch.tensor(selected_experts.shape[0], device="cpu", dtype=torch.long)
+    if selected_experts.numel() == 0:
+        expert_frequency = torch.zeros(num_experts, device=device, dtype=torch.long)
+    else:
+        expert_frequency = torch.bincount(
+            selected_experts.reshape(-1), minlength=num_experts
+        ).to(device)
+    pairwise_expert_frequency = expert_frequency.unsqueeze(0) + expert_frequency.unsqueeze(1)
+
+    layer_state["total_tokens"] += num_tokens
+    layer_state["expert_frequency"] += expert_frequency.to("cpu", torch.long)
+    layer_state["pairwise_expert_frequency"] += pairwise_expert_frequency.to(
+        "cpu", torch.long
+    )
+
+    ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    weighted_ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    reap = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    weighted_expert_frequency_sum = torch.zeros(
+        num_experts, device=device, dtype=torch.float64
+    )
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(device)
+    if renormalize_router_weights and selected_experts.numel() > 0:
+        topk_weights = torch.gather(routing_weights, 1, selected_experts)
+        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
+        routing_weights = torch.clamp(
+            routing_weights, min=torch.finfo(routing_weights.dtype).eps
+        )
+
+    for i in range(num_experts):
+        active_mask = (selected_experts == i).any(dim=-1)
+        if not active_mask.any():
+            continue
+
+        expert_input = flat_input_view[active_mask]
+        with torch.no_grad():
+            expert_output = experts[i](expert_input)
+        active_router_weights = routing_weights[active_mask, i]
+        ean_norm = torch.linalg.norm(expert_output.float(), dim=-1)
+
+        ean_sum[i] = ean_norm.sum().to(device)
+        ean_mean[i] = ean_norm.mean().to(device)
+        weighted_expert_frequency_sum[i] = active_router_weights.sum().to(device)
+        weighted_ean_sum[i] = (ean_norm * active_router_weights).sum().to(device)
+        reap[i] = (ean_norm * active_router_weights).mean().to(device)
+
+        selected_activations_max = expert_output.max().to(device="cpu")
+        if selected_activations_max > layer_state["max_activations"][i]:
+            layer_state["max_activations"][i] = selected_activations_max
+
+        del expert_input, expert_output, ean_norm
+
+    layer_state["ean_sum"] += ean_sum.to(device="cpu")
+    layer_state["ean_mean"].update(ean_mean.to("cpu"), expert_frequency.to("cpu"))
+    layer_state["weighted_ean_sum"] += weighted_ean_sum.to(device="cpu")
+    layer_state["reap"].update(reap.to("cpu"), expert_frequency.to("cpu"))
+    layer_state["weighted_expert_frequency_sum"] += weighted_expert_frequency_sum.to(
+        device="cpu"
+    )
+
+    return PreparedPruningBatch(
+        activations=torch.empty(0, device=device),
+        selected_experts=selected_experts,
+        router_logits=router_logits,
+        num_tokens=num_tokens,
+        expert_frequency=expert_frequency,
+        pairwise_expert_frequency=pairwise_expert_frequency,
+    )
