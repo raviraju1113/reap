@@ -18,6 +18,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import os
+import pickle
 import uuid
 import json
 import re
@@ -25,6 +26,35 @@ import random
 import logging
 
 _MAP_NUM_PROC = min(os.cpu_count() or 1, 16)
+
+
+def _is_picklable(obj) -> bool:
+    try:
+        pickle.dumps(obj)
+        return True
+    except Exception:
+        return False
+
+
+def _source_fingerprint(fn) -> str:
+    """Return a stable 16-char hex fingerprint derived from a function's source.
+
+    HF Datasets' default fingerprint for an importable function uses only its
+    module path + qualname (dill serializes a 64-byte reference, not bytecode),
+    so editing the function body doesn't invalidate the on-disk map() cache.
+    We hash the source text instead so any body change produces a new cache
+    file and stale shards aren't silently reused.
+    """
+    import hashlib
+    import inspect
+
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        # Built-ins/lambdas may have no retrievable source; fall back to repr
+        src = repr(fn)
+    qualname = getattr(fn, "__qualname__", repr(fn))
+    return hashlib.sha1(f"{qualname}\n{src}".encode("utf-8")).hexdigest()[:16]
 
 
 import torch
@@ -64,6 +94,7 @@ def _normalize_message_content(content) -> str:
 
 
 def _normalize_messages_for_chat_template(messages):
+    messages = _maybe_json_load(messages)
     if not isinstance(messages, list):
         return messages
 
@@ -324,6 +355,7 @@ class BaseDatasetProcessor(ABC):
         self.max_input_len = max_input_len
         self.dataset = dataset
         self._mapped_dataset = None
+        self._tokenized_dataset = None
         self.tokenizer = tokenizer
         self.split_by_category = split_by_category
         self.return_vllm_tokens_prompt = return_vllm_tokens_prompt
@@ -372,14 +404,51 @@ class BaseDatasetProcessor(ABC):
             "This method should be implemented by subclasses.",
         )
 
+    def _build_tokenize_fn(self):
+        """Return a picklable function that adds an `input_ids` column to a row.
+
+        Subclasses must implement this. The returned function must not close over
+        `self` so it can be pickled to worker processes when `num_proc > 1`.
+        """
+        raise NotImplementedError(
+            "This method should be implemented by subclasses.",
+        )
+
+    def _tokenize_dataset(self, mapped_dataset: Dataset) -> Dataset:
+        """Run a cached, parallel tokenization pass that materializes
+        `input_ids` as a column on the dataset. HF Datasets fingerprints the
+        function and the dataset state, so subsequent runs with the same
+        tokenizer + data hit the on-disk cache.
+        """
+        tokenize_fn = self._build_tokenize_fn()
+        if _is_picklable(tokenize_fn):
+            num_proc = _MAP_NUM_PROC
+        else:
+            num_proc = 1
+            logger.warning(
+                "Tokenizer/closure is not picklable; tokenizing dataset with "
+                "num_proc=1. Result will still be cached on disk for reruns."
+            )
+        new_fp = _source_fingerprint(self._build_tokenize_fn)
+        return mapped_dataset.map(
+            tokenize_fn,
+            num_proc=num_proc,
+            desc="Tokenizing samples",
+            new_fingerprint=new_fp,
+        )
+
     def get_processed_dataset(
         self, batches_per_category: int
     ) -> dict[str, list[TokensPrompt]] | dict[str, list[BatchEncoding]]:
         """Get requests for each category in the dataset."""
         if self._mapped_dataset is None:
             self._mapped_dataset = self.dataset.map(
-                self._map_fn, num_proc=_MAP_NUM_PROC
+                self._map_fn,
+                num_proc=_MAP_NUM_PROC,
+                new_fingerprint=_source_fingerprint(self._map_fn),
             )
+        if self._tokenized_dataset is None:
+            self._tokenized_dataset = self._tokenize_dataset(self._mapped_dataset)
         if self.split_by_category:
             categories = (
                 self.categories
@@ -387,13 +456,17 @@ class BaseDatasetProcessor(ABC):
                 else self.select_only_categories
             )
             return {
-                c: self._process_batches_for_category(c, batches_per_category)
+                c: self._process_batches_for_category(
+                    c, batches_per_category, self._tokenized_dataset
+                )
                 for c in categories
             }
         else:
             return {
                 self.all_categories_label: self._process_batches_for_category(
-                    self.all_categories_label, batches_per_category
+                    self.all_categories_label,
+                    batches_per_category,
+                    self._tokenized_dataset,
                 ),
             }
 
@@ -410,13 +483,14 @@ class BaseDatasetProcessor(ABC):
         self,
         category: str,
         batches_per_category: int,
+        source_dataset: Dataset,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         if category != self.all_categories_label:
-            category_dataset = self._mapped_dataset.filter(
+            category_dataset = source_dataset.filter(
                 lambda sample: sample[self.category_field] == category,
             )
         else:
-            category_dataset = self._mapped_dataset
+            category_dataset = source_dataset
             category = self.all_categories_label
 
         if self.pack_samples:
@@ -502,7 +576,9 @@ class BaseDatasetProcessor(ABC):
                 continue
             sampled.add(sample_idx)
             sample = category_dataset[sample_idx]
-            encoded_sample = self._encode_sample(sample)
+            encoded_sample = torch.tensor(
+                [sample["input_ids"]], dtype=torch.long
+            )
             if encoded_sample.shape[-1] > self.max_input_len:
                 if self.truncate:
                     encoded_sample = encoded_sample[:, : self.max_input_len]
@@ -562,7 +638,9 @@ class BaseDatasetProcessor(ABC):
                     continue
                 sampled.add(sample_idx)
                 sample = category_dataset[sample_idx]
-                encoded_sample = self._encode_sample(sample)  # shape (batch, seq)
+                encoded_sample = torch.tensor(
+                    [sample["input_ids"]], dtype=torch.long
+                )  # shape (1, seq)
                 end_seq = seq_idx + encoded_sample.shape[-1]
                 if end_seq > self.max_input_len:
                     encoded_sample = encoded_sample[:, : (self.max_input_len - seq_idx)]
@@ -611,6 +689,35 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
             return_tensors="pt",
         )["input_ids"]
 
+    def _build_tokenize_fn(self):
+        tokenizer = self.tokenizer
+        messages_field = self.messages_field
+        tools_field = self.tools_field
+        truncate = self.truncate
+        model_max_length = tokenizer.model_max_length
+
+        def tokenize_fn(sample: dict) -> dict:
+            chat_template_kwargs = {}
+            messages = _normalize_messages_for_chat_template(sample[messages_field])
+            if tools_field in sample:
+                chat_template_kwargs = {
+                    "tools": _maybe_json_load(sample[tools_field])
+                }
+            chat_sample = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=False,
+                tokenize=False,
+                **chat_template_kwargs,
+            )
+            input_ids = tokenizer(
+                chat_sample,
+                truncation=truncate,
+                max_length=model_max_length if truncate else None,
+            )["input_ids"]
+            return {"input_ids": input_ids}
+
+        return tokenize_fn
+
     def get_llmcompressor_dataset(self) -> Dataset:
         """Get the mapped dataset without tokenization applied."""
 
@@ -634,10 +741,16 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
 
         if self._mapped_dataset is None:
             self._mapped_dataset = self.dataset.map(
-                self._map_fn, num_proc=_MAP_NUM_PROC
+                self._map_fn,
+                num_proc=_MAP_NUM_PROC,
+                new_fingerprint=_source_fingerprint(self._map_fn),
             )
 
-        return self._mapped_dataset.map(chat_template_fn, num_proc=_MAP_NUM_PROC)
+        return self._mapped_dataset.map(
+            chat_template_fn,
+            num_proc=_MAP_NUM_PROC,
+            new_fingerprint=_source_fingerprint(chat_template_fn),
+        )
 
 
 class LMDatasetProcessor(BaseDatasetProcessor):
@@ -649,12 +762,30 @@ class LMDatasetProcessor(BaseDatasetProcessor):
             return_tensors="pt",
         )["input_ids"]
 
+    def _build_tokenize_fn(self):
+        tokenizer = self.tokenizer
+        text_field = self.text_field
+        truncate = self.truncate
+        model_max_length = tokenizer.model_max_length
+
+        def tokenize_fn(sample: dict) -> dict:
+            input_ids = tokenizer(
+                sample[text_field],
+                truncation=truncate,
+                max_length=model_max_length if truncate else None,
+            )["input_ids"]
+            return {"input_ids": input_ids}
+
+        return tokenize_fn
+
     def get_llmcompressor_dataset(self) -> Dataset:
         """Get the mapped dataset without tokenization applied."""
 
         if self._mapped_dataset is None:
             self._mapped_dataset = self.dataset.map(
-                self._map_fn, num_proc=_MAP_NUM_PROC
+                self._map_fn,
+                num_proc=_MAP_NUM_PROC,
+                new_fingerprint=_source_fingerprint(self._map_fn),
             )
 
         return self._mapped_dataset
@@ -800,15 +931,16 @@ class XLamFunctionCallingDataset(ChatDatasetProcessor):
                 }
             )
 
+        messages = [
+            {"role": "user", "content": sample["query"]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": tool_calls,
+            },
+        ]
         return {
-            "messages": [
-                {"role": "user", "content": sample["query"]},
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": tool_calls,
-                },
-            ],
+            "messages": json.dumps(messages),
             "tools": (
                 sample["tools"]
                 if isinstance(sample["tools"], str)
@@ -966,8 +1098,8 @@ class SWESmithTrajectoriesDataset(ChatDatasetProcessor):
             formatted_messages.append(formatted_message)
 
         return {
-            "messages": formatted_messages,
-            "tools": SWESmithTrajectoriesDataset.tools,
+            "messages": json.dumps(formatted_messages),
+            "tools": json.dumps(SWESmithTrajectoriesDataset.tools),
         }
 
 

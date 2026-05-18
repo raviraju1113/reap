@@ -46,6 +46,46 @@ from reap.models.modeling_deepseek_v3_patch import patch_deepseek_v3_moe
 from reap.eval import run_evaluate
 import shutil
 
+
+def _disable_compressed_linear_weight_caching(model):
+    """Stop CompressedLinear from caching the dequantized weight.
+
+    Why: upstream ``CompressedLinear.forward`` decompresses int4-packed weights
+    into bf16 on first call, stores the result as ``self.weight``, and flips
+    ``quantization_status`` to FROZEN — so the bf16 weight is kept alive for
+    the lifetime of the process while ``weight_packed`` / scales also stay on
+    the module. For K2.5's 384-expert MoE this permanently grows GPU memory by
+    ~4x per touched expert and OOMs after a handful of calibration tokens.
+
+    How to apply: trade re-decompression compute on every forward for keeping
+    weights packed in VRAM (acceptable since prune.py runs only ~1k forwards).
+    The patch rebinds both the class-level forward and any ``_old_forward``
+    captured by accelerate's pre/post hooks (set at model-load time).
+    """
+    try:
+        from compressed_tensors.linear.compressed_linear import CompressedLinear
+        from compressed_tensors.quantization import QuantizationStatus
+    except ImportError:
+        return 0
+    from torch.nn.functional import linear as _linear
+
+    def _stateless_forward(self, input):
+        if self.quantization_status == QuantizationStatus.COMPRESSED:
+            weight_data = self.compressor.decompress_module(self)
+            return _linear(input, weight_data, self.bias)
+        return _linear(input, self.weight, self.bias)
+
+    CompressedLinear.forward = _stateless_forward
+    rebound = 0
+    for module in model.modules():
+        if isinstance(module, CompressedLinear):
+            if hasattr(module, "_old_forward"):
+                module._old_forward = _stateless_forward.__get__(
+                    module, CompressedLinear
+                )
+            rebound += 1
+    return rebound
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -256,6 +296,11 @@ def main():
         # 61 decoder layers total: layer 0 is dense (~0.6 GiB), layers 1-60 are
         # MoE (~9.5 GiB each). Distribute roughly evenly: 8 GPUs × ~7.5 MoE
         # layers each, plus embed on GPU 0 and lm_head/final_norm on GPU 7.
+        # Vision tower / mm_projector stay on a real GPU device: placing them
+        # on "cpu" leaves their non-persistent buffers (ViT positional embeds
+        # etc.) on the meta device after from_pretrained's init_empty_weights
+        # pass, and accelerate's AlignDevicesHook.pre_forward then dies with
+        # "Cannot copy out of meta tensor" on the first forward call.
         custom_map = {
             "vision_tower": 0,
             "mm_projector": 0,
@@ -273,6 +318,11 @@ def main():
             end = boundaries[gpu_idx + 1] + 1
             for layer_idx in range(start, end):
                 custom_map[f"language_model.model.layers.{layer_idx}"] = gpu_idx
+        # GPU 0 also carries embed_tokens (~2.3 GiB) + the dense layer 0 and is
+        # the input device for every forward, so it accumulates the most
+        # activation pressure. Shift one MoE layer off GPU 0 onto GPU 1 (which
+        # otherwise has only 7 MoE layers) to free ~10.8 GiB of headroom.
+        custom_map["language_model.model.layers.8"] = 1
         load_kwargs["device_map"] = custom_map
         logger.info(
             "Using explicit K2.5 device_map: %s MoE layers distributed across %s GPUs",
@@ -310,6 +360,15 @@ def main():
     # Patch DeepSeek-V3 / Kimi-K2.5 MoE gate to expose router_logits (no-op for
     # other architectures).
     patch_deepseek_v3_moe(model)
+    # Stop CompressedLinear (int4 routed-expert weights) from caching the
+    # bf16 dequant — otherwise GPU memory grows ~4x per visited expert during
+    # the first calibration batch and OOMs immediately on K2.5.
+    n_compressed = _disable_compressed_linear_weight_caching(model)
+    if n_compressed:
+        logger.info(
+            "Patched %d CompressedLinear modules to re-decompress per forward",
+            n_compressed,
+        )
     logger.info("Model patched for REAP")
     # record activations or load previously recorded activations
     logger.info(
@@ -399,13 +458,13 @@ def main():
 
         dump_args_to_yaml(
             pruned_model_dir,
-            reap_args,
-            ds_args,
-            obs_args,
-            model_args,
-            eval_args,
-            prune_args,
-            cluster_args,
+            reap_args=reap_args,
+            ds_args=ds_args,
+            obs_args=obs_args,
+            model_args=model_args,
+            eval_args=eval_args,
+            prune_args=prune_args,
+            cluster_args=cluster_args,
         )
 
     # eval

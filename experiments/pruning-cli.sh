@@ -1,6 +1,10 @@
 #!/bin/bash
 
 export CUDA_VISIBLE_DEVICES=${1}
+# Reduce VRAM fragmentation during the K2.5 calibration pass — the
+# CompressedLinear dequant-on-every-forward path (see prune.py) allocates and
+# frees a bf16 weight tensor per expert per forward.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 FIRST_DEVICE=$(echo "$1" | cut -d',' -f1)
 port=$((8000 + FIRST_DEVICE))
 model_name=${2:-"Qwen/Qwen3-30B-A3B"}
@@ -34,8 +38,8 @@ run_math=${10:-false}
 run_wildbench=${11:-false}
 singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
-batch_size=1
-num_batches=1024
+batch_size=8
+num_batches=128
 output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 
@@ -65,31 +69,31 @@ python src/reap/prune.py \
     --batches_per_category ${num_batches} \
     --record_pruning_metrics_only true
 
-short_model_name=$(artifact_dir_name "$model_name")
-short_dataset_name=$(artifact_dir_name "$dataset_name")
+# short_model_name=$(artifact_dir_name "$model_name")
+# short_dataset_name=$(artifact_dir_name "$dataset_name")
 
-pruned_model_dir_name="${pruning_method}"
-if [[ "${singleton_super_experts}" == "true" ]]; then
-    pruned_model_dir_name="${pruned_model_dir_name}-perserve_super"
-elif [[ "${singleton_outlier_experts}" == "true" ]]; then
-    pruned_model_dir_name="${pruned_model_dir_name}-perserve_outlier"
-fi
-pruned_model_dir_name="${pruned_model_dir_name}-seed_${seed}-${compression_ratio}"
+# pruned_model_dir_name="${pruning_method}"
+# if [[ "${singleton_super_experts}" == "true" ]]; then
+#     pruned_model_dir_name="${pruned_model_dir_name}-perserve_super"
+# elif [[ "${singleton_outlier_experts}" == "true" ]]; then
+#     pruned_model_dir_name="${pruned_model_dir_name}-perserve_outlier"
+# fi
+# pruned_model_dir_name="${pruned_model_dir_name}-seed_${seed}-${compression_ratio}"
 
-model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruned_model_dir_name}"
+# model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruned_model_dir_name}"
 
-echo "evaluating model: ${model_dir}"
-bash experiments/eval.sh \
-    $model_dir \
-    $seed\
-    $port \
-    $server_log_file_name \
-    ${run_lm_eval} \
-    ${run_evalplus} \
-    ${run_livecodebench} \
-    ${run_math} \
-    ${run_wildbench}
-echo "Finished evaluating model: ${pruned_model}"
+# echo "evaluating model: ${model_dir}"
+# bash experiments/eval.sh \
+#     $model_dir \
+#     $seed\
+#     $port \
+#     $server_log_file_name \
+#     ${run_lm_eval} \
+#     ${run_evalplus} \
+#     ${run_livecodebench} \
+#     ${run_math} \
+#     ${run_wildbench}
+# echo "Finished evaluating model: ${pruned_model}"
 
-# echo "Removing safetensor files from ${model_dir}"
-# rm ${model_dir}/*.safetensors
+# # echo "Removing safetensor files from ${model_dir}"
+# # rm ${model_dir}/*.safetensors
