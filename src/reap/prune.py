@@ -32,9 +32,59 @@ from reap.cluster import (
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import (
+    get_moe,
+    assert_merge,
+    MODEL_ATTRS,
+    patched_model_map,
+    get_super_expert_indices,
+    get_text_config,
+    maybe_override_vision_attn_impl,
+    save_processor_and_aux_files,
+)
+from reap.models.modeling_deepseek_v3_patch import patch_deepseek_v3_moe
 from reap.eval import run_evaluate
 import shutil
+
+
+def _disable_compressed_linear_weight_caching(model):
+    """Stop CompressedLinear from caching the dequantized weight.
+
+    Why: upstream ``CompressedLinear.forward`` decompresses int4-packed weights
+    into bf16 on first call, stores the result as ``self.weight``, and flips
+    ``quantization_status`` to FROZEN — so the bf16 weight is kept alive for
+    the lifetime of the process while ``weight_packed`` / scales also stay on
+    the module. For K2.5's 384-expert MoE this permanently grows GPU memory by
+    ~4x per touched expert and OOMs after a handful of calibration tokens.
+
+    How to apply: trade re-decompression compute on every forward for keeping
+    weights packed in VRAM (acceptable since prune.py runs only ~1k forwards).
+    The patch rebinds both the class-level forward and any ``_old_forward``
+    captured by accelerate's pre/post hooks (set at model-load time).
+    """
+    try:
+        from compressed_tensors.linear.compressed_linear import CompressedLinear
+        from compressed_tensors.quantization import QuantizationStatus
+    except ImportError:
+        return 0
+    from torch.nn.functional import linear as _linear
+
+    def _stateless_forward(self, input):
+        if self.quantization_status == QuantizationStatus.COMPRESSED:
+            weight_data = self.compressor.decompress_module(self)
+            return _linear(input, weight_data, self.bias)
+        return _linear(input, self.weight, self.bias)
+
+    CompressedLinear.forward = _stateless_forward
+    rebound = 0
+    for module in model.modules():
+        if isinstance(module, CompressedLinear):
+            if hasattr(module, "_old_forward"):
+                module._old_forward = _stateless_forward.__get__(
+                    module, CompressedLinear
+                )
+            rebound += 1
+    return rebound
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -124,14 +174,24 @@ def prune(
             # prune router
             router = getattr(moe, model_attrs["router"])
             router.weight.data = router.weight.data[retained_expert_indicies, :]
-            if getattr(router, "bias", None):
+            if getattr(router, "bias", None) is not None:
                 router.bias.data = router.bias.data[retained_expert_indicies]
-            router.out_features = len(retained_expert_indicies)
+            # Linear-style routers expose out_features; parameter-style gates
+            # (DeepSeek-V2/V3 MoEGate) don't — keep them in sync where present.
+            if hasattr(router, "out_features"):
+                router.out_features = len(retained_expert_indicies)
+            if hasattr(router, "n_routed_experts"):
+                # MoEGate caches the expert count in __init__; update it so the
+                # noaux_tc top-k path keeps working post-prune.
+                router.n_routed_experts = len(retained_expert_indicies)
             if hasattr(router, "e_score_correction_bias"):
                 router.e_score_correction_bias.data = (
                     router.e_score_correction_bias.data[retained_expert_indicies]
                 )
             setattr(moe, model_attrs["router"], router)
+            # DeepSeek-V3 MoE block caches experts_per_rank from config (ep_size=1)
+            if hasattr(moe, "experts_per_rank"):
+                moe.experts_per_rank = len(retained_expert_indicies)
         else:
             # prune fused experts, only tested for llama-4
             moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
@@ -147,7 +207,9 @@ def prune(
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
+    # For multimodal wrappers (e.g., Kimi-K2.5) n_routed_experts lives on
+    # model.config.text_config, not model.config — get_text_config resolves either.
+    setattr(get_text_config(model), model_attrs["num_experts"], retained_experts)
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,
@@ -218,13 +280,96 @@ def main():
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
+    logger.info("Loading model")
+    load_kwargs = dict(
         torch_dtype="auto",
         trust_remote_code=True,
         local_files_only=True,
     )
+    # Accelerate's ``balanced``/``auto`` policies kept spilling K2.5 layers to
+    # disk (each DeepseekDecoderLayer is ~9.5 GiB and can't be split; the
+    # leftover space per GPU was always smaller than one layer). For Kimi-K2.5
+    # specifically, fall back to an explicit device_map that packs all 60 MoE
+    # layers + embed/lm_head across 8 GPUs deterministically.
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpus >= 8 and "Kimi-K2" in model_name:
+        # 61 decoder layers total: layer 0 is dense (~0.6 GiB), layers 1-60 are
+        # MoE (~9.5 GiB each). Distribute roughly evenly: 8 GPUs × ~7.5 MoE
+        # layers each, plus embed on GPU 0 and lm_head/final_norm on GPU 7.
+        # Vision tower / mm_projector stay on a real GPU device: placing them
+        # on "cpu" leaves their non-persistent buffers (ViT positional embeds
+        # etc.) on the meta device after from_pretrained's init_empty_weights
+        # pass, and accelerate's AlignDevicesHook.pre_forward then dies with
+        # "Cannot copy out of meta tensor" on the first forward call.
+        custom_map = {
+            "vision_tower": 0,
+            "mm_projector": 0,
+            "language_model.model.embed_tokens": 0,
+            "language_model.model.norm": n_gpus - 1,
+            "language_model.lm_head": n_gpus - 1,
+            "language_model.model.layers.0": 0,  # dense layer
+        }
+        moe_layer_count = 60
+        boundaries = [
+            round(i * moe_layer_count / n_gpus) for i in range(n_gpus + 1)
+        ]
+        for gpu_idx in range(n_gpus):
+            start = boundaries[gpu_idx] + 1  # +1 because layer 0 already placed
+            end = boundaries[gpu_idx + 1] + 1
+            for layer_idx in range(start, end):
+                custom_map[f"language_model.model.layers.{layer_idx}"] = gpu_idx
+        # GPU 0 also carries embed_tokens (~2.3 GiB) + the dense layer 0 and is
+        # the input device for every forward, so it accumulates the most
+        # activation pressure. Shift one MoE layer off GPU 0 onto GPU 1 (which
+        # otherwise has only 7 MoE layers) to free ~10.8 GiB of headroom.
+        custom_map["language_model.model.layers.8"] = 1
+        load_kwargs["device_map"] = custom_map
+        logger.info(
+            "Using explicit K2.5 device_map: %s MoE layers distributed across %s GPUs",
+            moe_layer_count,
+            n_gpus,
+        )
+    else:
+        load_kwargs["device_map"] = "balanced"
+        if n_gpus > 1:
+            load_kwargs["max_memory"] = {i: "100GiB" for i in range(n_gpus)}
+    # prune.py runs full-model forwards; flash_attention_2 saves the manual
+    # softmax tensor and is safe here (no replay-cache mask alignment issue).
+    override_config = maybe_override_vision_attn_impl(
+        model_name, enable_text_flash_attn=True
+    )
+    if override_config is not None:
+        load_kwargs["config"] = override_config
+    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    logger.info("Model loaded")
+    # Log actual device placement so OOMs are debuggable.
+    if hasattr(model, "hf_device_map"):
+        from collections import Counter
+        dev_counts = Counter(model.hf_device_map.values())
+        logger.info(
+            "device_map distribution (module -> device count): %s", dict(dev_counts)
+        )
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                free, total = torch.cuda.mem_get_info(i)
+                used_gb = (total - free) / (1024**3)
+                free_gb = free / (1024**3)
+                logger.info(
+                    f"GPU {i}: {used_gb:.1f} GiB used, {free_gb:.1f} GiB free post-load"
+                )
+    # Patch DeepSeek-V3 / Kimi-K2.5 MoE gate to expose router_logits (no-op for
+    # other architectures).
+    patch_deepseek_v3_moe(model)
+    # Stop CompressedLinear (int4 routed-expert weights) from caching the
+    # bf16 dequant — otherwise GPU memory grows ~4x per visited expert during
+    # the first calibration batch and OOMs immediately on K2.5.
+    n_compressed = _disable_compressed_linear_weight_caching(model)
+    if n_compressed:
+        logger.info(
+            "Patched %d CompressedLinear modules to re-decompress per forward",
+            n_compressed,
+        )
+    logger.info("Model patched for REAP")
     # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
@@ -296,6 +441,7 @@ def main():
                 pass
 
         tokenizer.save_pretrained(pruned_model_dir)
+        save_processor_and_aux_files(model_name, pruned_model_dir)
         if model_name == "artifacts/models/GLM-4.5-Air":
             # move modelling file
             source_file = pathlib.Path(model_name) / "modeling_glm4_moe.py"
@@ -312,13 +458,13 @@ def main():
 
         dump_args_to_yaml(
             pruned_model_dir,
-            reap_args,
-            ds_args,
-            obs_args,
-            model_args,
-            eval_args,
-            prune_args,
-            cluster_args,
+            reap_args=reap_args,
+            ds_args=ds_args,
+            obs_args=obs_args,
+            model_args=model_args,
+            eval_args=eval_args,
+            prune_args=prune_args,
+            cluster_args=cluster_args,
         )
 
     # eval

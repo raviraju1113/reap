@@ -44,7 +44,12 @@ from reap.args import (
     LayerwiseArgs,
 )
 from reap.data import load_category_batches, parse_composite_dataset_spec
-from reap.model_util import patched_model_map
+from reap.model_util import (
+    patched_model_map,
+    maybe_override_vision_attn_impl,
+    save_processor_and_aux_files,
+)
+from reap.models.modeling_deepseek_v3_patch import patch_deepseek_v3_moe
 from reap.observer import OBSERVER_CONFIG_REGISTRY
 from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
@@ -279,14 +284,18 @@ def main():
 
         # Load model on CPU for layerwise processing
         logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
+        load_kwargs = dict(
             device_map="cpu",
             torch_dtype="auto",
             trust_remote_code=True,
             low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
         )
+        override_config = maybe_override_vision_attn_impl(model_name)
+        if override_config is not None:
+            load_kwargs["config"] = override_config
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         model.eval()
+        patch_deepseek_v3_moe(model)
 
         logger.info(f"Model loaded: {model.__class__.__name__}")
         num_params = sum(p.numel() for p in model.parameters())
@@ -313,24 +322,30 @@ def main():
         logger.info("Observer run completed. Exiting (run_observer_only=True)")
         return
 
-    # Calculate number of experts to prune
+    # Drop non-MoE entries (dense first layers in DeepSeek-V3 / Kimi-K25 can
+    # leave empty dicts in observer_data when restored from intermediate
+    # checkpoints). Downstream prune() assumes every layer has expert_frequency.
+    observer_data = {
+        layer: metrics
+        for layer, metrics in observer_data.items()
+        if "expert_frequency" in metrics
+    }
+    if not observer_data:
+        raise ValueError("observer_data contains no MoE blocks with expert_frequency")
+    total_experts = len(
+        observer_data[next(iter(observer_data))]["expert_frequency"]
+    )
+
     n_experts_to_prune = prune_args.n_experts_to_prune
     if n_experts_to_prune is None:
         if cluster_args.compression_ratio is None:
             raise ValueError(
                 "Either n_experts_to_prune or compression_ratio must be set."
             )
-        total_experts = len(
-            observer_data[next(iter(observer_data))]["expert_frequency"]
-        )
         n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
         logger.info(
             f"Calculated n_experts_to_prune: {n_experts_to_prune} "
             f"(compression_ratio: {cluster_args.compression_ratio})"
-        )
-    else:
-        total_experts = len(
-            observer_data[next(iter(observer_data))]["expert_frequency"]
         )
 
     # Get output directory
@@ -354,19 +369,28 @@ def main():
             f"Pruned model already exists at {pruned_model_dir}. Skipping pruning."
         )
     else:
-        # Reload model on auto device for pruning
-        logger.info("Reloading model on GPU for pruning...")
+        # Reload model on CPU for pruning. Pruning is just tensor slicing on
+        # weights — it doesn't need a GPU, and `device_map="auto"` triggers
+        # accelerate disk-offload for large MoEs (e.g., 170B Kimi-K25 on 1 GPU),
+        # which breaks save_pretrained: the offloaded copy keeps the original
+        # router/expert shapes and conflicts with the in-memory pruned shapes.
+        logger.info("Reloading model on CPU for pruning...")
         if model is not None:
             del model
         cleanup_memory()
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
+        load_kwargs = dict(
+            device_map="cpu",
             torch_dtype="auto",
             trust_remote_code=True,
             local_files_only=True,
+            low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
         )
+        override_config = maybe_override_vision_attn_impl(model_name)
+        if override_config is not None:
+            load_kwargs["config"] = override_config
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        patch_deepseek_v3_moe(model)
 
         # Prune
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
@@ -380,6 +404,7 @@ def main():
 
         # Save tokenizer
         tokenizer.save_pretrained(pruned_model_dir)
+        save_processor_and_aux_files(model_name, pruned_model_dir)
 
         # Save args
         dump_args_to_yaml(
