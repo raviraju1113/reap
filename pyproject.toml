@@ -32,14 +32,24 @@ dependencies = [
     "evalscope",
 ]
 
+[[tool.uv.index]]
+# B200 (Blackwell, sm_100) needs CUDA 12.8 torch wheels; PyPI default is cu126 (max sm_90).
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.uv.sources]
 evalplus = { path = "third-party/evalplus", editable = true }
 livecodebench = { path="third-party/LiveCodeBench", editable = true}
 crfm-helm = { path="third-party/helm", editable = true }
 evalscope = { path = "third-party/evalscope", editable=true}
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
 
 [project.entry-points."vllm.general_plugins"]
 llama_4_text_only = "reap.model_util:register_llama_with_vllm"
+kimi_k25_text_only = "reap.model_util:register_kimi_k25_with_vllm"
 
 [build-system]
 requires = ["hatchling"]

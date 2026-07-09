@@ -408,3 +408,12 @@ def register_llama_with_vllm():
     from vllm.model_executor.models import ModelRegistry
     print("Registering Llama4ForCausalLM with vLLM")
     ModelRegistry.register_model("Llama4ForCausalLM", "vllm.model_executor.models.llama4:Llama4ForCausalLM")
+
+
+def register_kimi_k25_with_vllm():
+    from vllm.model_executor.models import ModelRegistry
+    print("Registering KimiK25ForConditionalGeneration (text-only) with vLLM")
+    ModelRegistry.register_model(
+        "KimiK25ForConditionalGeneration",
+        "reap.models.kimi_k25_vllm:KimiK25ForConditionalGeneration",
+    )
