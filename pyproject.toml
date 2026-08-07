@@ -50,6 +50,10 @@ torchaudio = { index = "pytorch-cu128" }
 [project.entry-points."vllm.general_plugins"]
 llama_4_text_only = "reap.model_util:register_llama_with_vllm"
 kimi_k25_text_only = "reap.model_util:register_kimi_k25_with_vllm"
+# Installs the EP-node-failure routing hook in every worker process. Inert
+# until a mask is set (via POST /reap/failure or the REAP_* env vars), so it is
+# safe to leave enabled for ordinary serving.
+expert_failure = "reap.expert_failure:patch_select_experts"
 
 [build-system]
 requires = ["hatchling"]
