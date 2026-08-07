@@ -194,15 +194,24 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
     logger.info(f"Results will be saved to {results_dir}")
     num_gpus = torch.cuda.device_count()
     model_name = patched_model_map(model_name)
+    process = None
     if use_server:
-        server_endpoint, process = start_server(
-            model_name,
-            model_args,
-            eval_args,
-            seed,
-            log_file=eval_args.server_log_file_name,
-            port=eval_args.vllm_port,
-        )
+        existing = getattr(eval_args, "existing_server_url", None)
+        if existing:
+            # Attach to a caller-owned server. `process` stays None so the
+            # teardown below leaves it running for the next evaluation.
+            server_endpoint = existing.rstrip("/")
+            logger.info(f"Using existing vLLM server at {server_endpoint}")
+            wait_for_server(server_endpoint)
+        else:
+            server_endpoint, process = start_server(
+                model_name,
+                model_args,
+                eval_args,
+                seed,
+                log_file=eval_args.server_log_file_name,
+                port=eval_args.vllm_port,
+            )
 
     if eval_args.run_lm_eval:
         results_file_base_name = results_dir / "lm_eval_results"
@@ -381,10 +390,7 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                     "max_new_tokens": 16384,
                     "chat_template_kwargs": {"enable_thinking": False},
                 },
-                datasets=[
-                    "gsm8k",
-                    "math_500",
-                ],
+                datasets=list(getattr(eval_args, "math_tasks", None) or ["gsm8k", "math_500"]),
                 api_url=f"{server_endpoint}/v1",
                 api_key="EMPTY",
                 timeout=3600,
@@ -402,11 +408,15 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
             logger.info(f"Finished evaluating evalscope math benchmarks")
         except Exception as e:
             logger.error(f"An error occurred during math evaluation: {e}")
-            pass
+            # Swallowing here means the caller cannot distinguish "benchmark ran"
+            # from "benchmark blew up", which for a sweep turns into a completed
+            # cell holding no results. Opt in to failing loud with `strict`.
+            if getattr(eval_args, "strict", False):
+                raise
 
-    if use_server:
-        process.terminate()
-    if use_server and "process" in locals():
+    # Only tear down a server this call started; an `existing_server_url` server
+    # belongs to the caller (see the node-failure sweep) and must outlive us.
+    if process is not None:
         process.terminate()
 
 

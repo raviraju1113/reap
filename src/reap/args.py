@@ -430,6 +430,29 @@ class EvalArgs:
         default=False,
         metadata={"help": "Whether to run evaluation using math tasks."},
     )
+    math_tasks: list[str] = field(
+        default_factory=lambda: ["gsm8k", "math_500"],
+        metadata={
+            "help": (
+                "evalscope datasets to run when `run_math` is set. Defaults to "
+                "the historical gsm8k+math_500 pair; pass just ['math_500'] to "
+                "avoid paying for gsm8k's 1319 extra problems when only MATH-500 "
+                "is wanted (the node-failure sweep does this)."
+            )
+        },
+    )
+    strict: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Re-raise benchmark errors instead of logging and continuing. "
+                "`run_evaluate` swallows per-benchmark exceptions by default so "
+                "one bad task does not abort a suite; that is wrong for a sweep, "
+                "where a silently-skipped benchmark gets recorded as a completed "
+                "cell with no results."
+            )
+        },
+    )
 
     lm_eval_tasks: list[str] = field(
         default_factory=lambda: [
@@ -473,6 +496,18 @@ class EvalArgs:
         default=32,
         metadata={
             "help": "Number of parallel tasks to run during evalplus evaluation."
+        },
+    )
+    existing_server_url: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Base URL of an already-running vLLM server (e.g. "
+                "http://0.0.0.0:8000). When set, `run_evaluate` attaches to it "
+                "instead of starting and tearing down its own, and leaves it "
+                "running afterwards. Used by the node-failure sweep, where "
+                "reloading a ~1TB checkpoint per cell would dominate runtime."
+            )
         },
     )
 
