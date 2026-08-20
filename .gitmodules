@@ -16,3 +16,12 @@
 [submodule "third-party/evalscope"]
     path = third-party/evalscope
     url = https://github.com/mklasby/evalscope.git
+[submodule "third-party/gorilla"]
+	path = third-party/gorilla
+	url = https://github.com/ShishirPatil/gorilla.git
+	# Sparse: only berkeley-function-call-leaderboard is checked out, and the
+	# fetch is blobless rather than shallow -- the pin is a specific commit, so
+	# a shallow fetch breaks as soon as upstream moves past it. Use
+	# `bash scripts/setup_bfcl.sh`, which does the fetch and the sparse-checkout
+	# together. Upstream is used unmodified; the local model entry is registered
+	# in-process by src/reap/bfcl_client.

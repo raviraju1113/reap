@@ -4,8 +4,8 @@ These run against the real ``FusedMoE.select_experts`` with synthetic router
 logits. No model weights are needed, so the masking math can be verified
 without a checkpoint.
 
-Every semantic test runs against **both** routing paths the experiment cares
-about, because they are genuinely different code inside vLLM:
+Every semantic test runs against **all three** routing profiles the experiment
+cares about, because they are genuinely different code inside vLLM:
 
 ``qwen3``
     Qwen3-30B-A3B: 128 experts, top-8, plain ``softmax`` + ``fused_topk``, no
@@ -13,9 +13,16 @@ about, because they are genuinely different code inside vLLM:
 ``k2.6``
     Kimi-K2.6: 384 experts, top-8, ``grouped_topk`` with ``scoring_func="sigmoid"``
     and an ``e_score_correction_bias`` (``noaux_tc``).
+``glm4.5-air``
+    GLM-4.5-Air: 128 experts, top-8, and the *same* ``grouped_topk`` +
+    ``sigmoid`` + bias path as K2.6 but with a single expert group
+    (``n_group=1``, ``topk_group=1``, from the checkpoint's config), so
+    selection is global. It shares Qwen3's 4-experts-per-node block size and
+    K2.6's routing implementation, which is exactly the combination the
+    GLM-4.5-Air sweep runs and neither of the other two profiles covers.
 
-Both partition into 32 nodes and both route top-8, so they drop the same 1/32
-of experts per node and share the same 22.4% expected dead-slot rate.
+All three partition into 32 nodes and all three route top-8, so they drop the
+same 1/32 of experts per node and share the same 22.4% expected dead-slot rate.
 
 The properties that matter for the experiment to be trustworthy:
 
@@ -50,6 +57,13 @@ class Profile:
     use_grouped_topk: bool
     scoring_func: str
     has_bias: bool
+    # Only read on the grouped_topk path, where vLLM asserts both are non-None.
+    # 1/1 is GLM-4.5-Air's real config (`n_group`/`topk_group` in config.json);
+    # for K2.6 it is a simplification of its 8/4 grouping that keeps selection
+    # global, which is the harder case for the mask (nothing restricts which
+    # experts a token may substitute towards under `reroute`).
+    num_expert_group: int = 1
+    topk_group: int = 1
 
     @property
     def per_node(self) -> int:
@@ -58,8 +72,15 @@ class Profile:
 
 QWEN3 = Profile("qwen3", 128, 8, 32, use_grouped_topk=False, scoring_func="softmax", has_bias=False)
 K2 = Profile("k2.6", 384, 8, 32, use_grouped_topk=True, scoring_func="sigmoid", has_bias=True)
+# GLM-4.5-Air: Qwen3's expert count and block size on K2.6's routing path.
+# vllm/model_executor/models/glm4_moe.py builds FusedMoE with
+# use_grouped_topk=True, scoring_func="sigmoid" and the gate's
+# e_score_correction_bias, so the bias must be masked alongside the logits.
+GLM45_AIR = Profile(
+    "glm4.5-air", 128, 8, 32, use_grouped_topk=True, scoring_func="sigmoid", has_bias=True
+)
 
-PROFILES = [QWEN3, K2]
+PROFILES = [QWEN3, K2, GLM45_AIR]
 _ids = [p.name for p in PROFILES]
 
 
@@ -135,7 +156,7 @@ def _route(p: Profile, hidden_states, router_logits, bias):
     )
     if p.use_grouped_topk:
         # grouped_topk asserts these are non-None even in the 1-group case.
-        kwargs.update(topk_group=1, num_expert_group=1)
+        kwargs.update(topk_group=p.topk_group, num_expert_group=p.num_expert_group)
     if bias is not None:
         kwargs["e_score_correction_bias"] = bias
     return FusedMoE.select_experts(**kwargs)
@@ -201,11 +222,22 @@ def test_experts_for_node_matches_ep_layout(p: Profile):
         expert_failure.experts_for_node(p.num_nodes, p.num_experts, p.num_nodes)
 
 
-def test_qwen3_and_k2_drop_the_same_fraction():
-    """The two topologies are interchangeable for this experiment: same 1/32."""
-    assert QWEN3.per_node / QWEN3.num_experts == K2.per_node / K2.num_experts == 1 / 32
-    assert QWEN3.top_k == K2.top_k
-    assert QWEN3.per_node == 4 and K2.per_node == 12
+def test_all_profiles_drop_the_same_fraction():
+    """The topologies are interchangeable for this experiment: same 1/32, same top-8.
+
+    This is what licenses comparing a Qwen3 sweep to a GLM-4.5-Air one and
+    treating either as a stand-in for K2.6: identical drop fraction and
+    identical top-k means identical per-token failure statistics
+    (``1 - (1 - 1/32)^8 = 22.4%`` of tokens lose at least one expert).
+    """
+    for p in PROFILES:
+        assert p.per_node / p.num_experts == 1 / 32, p.name
+        assert p.top_k == 8, p.name
+    assert QWEN3.per_node == 4
+    assert K2.per_node == 12
+    # GLM-4.5-Air has Qwen3's 128 experts, so a node is the same 4-expert block.
+    assert GLM45_AIR.per_node == 4
+    assert GLM45_AIR.num_experts == QWEN3.num_experts
 
 
 def test_uneven_partition_is_rejected():
@@ -249,20 +281,27 @@ def test_reroute_never_selects_dead_experts(profile, routing_inputs):
         assert len(set(row.tolist())) == profile.top_k
 
 
-def test_reroute_masks_a_high_bias_dead_expert():
+@pytest.mark.parametrize(
+    "p", [p for p in PROFILES if p.has_bias], ids=[p.name for p in PROFILES if p.has_bias]
+)
+def test_reroute_masks_a_high_bias_dead_expert(p: Profile):
     """A dead expert with a dominant correction bias must still be excluded.
 
-    K2.6-only: this is the case that fails if only `router_logits` is masked,
-    since selection scores are sigmoid(logits) + bias and sigmoid(min)=0 still
-    leaves `bias`. Qwen3 passes no bias, so there is nothing to exercise.
+    This is the case that fails if only ``router_logits`` is masked: selection
+    scores are ``sigmoid(logits) + bias`` and ``sigmoid(min) = 0`` still leaves
+    ``bias``, so a dead expert with a large positive bias wins a slot anyway.
+    Applies to every ``noaux_tc`` model -- K2.6 and GLM-4.5-Air both pass a
+    bias. Qwen3 passes none, so it is excluded rather than tested vacuously.
     """
-    hidden_states, router_logits, bias = _make_inputs(K2)
+    hidden_states, router_logits, bias = _make_inputs(p)
     bias = bias.clone()
-    bias[5] = 1e3  # expert 5 would win every slot on bias alone
+    # Inside node 0's block for either topology (0-11 for K2.6, 0-3 for GLM).
+    dead_expert = p.per_node - 1
+    bias[dead_expert] = 1e3  # would win every slot on bias alone
 
-    _set(K2, "reroute", node_id=0)  # experts 0-11
-    _, ids = _route(K2, hidden_states, router_logits, bias)
-    assert 5 not in set(ids.flatten().tolist())
+    _set(p, "reroute", node_id=0)
+    _, ids = _route(p, hidden_states, router_logits, bias)
+    assert dead_expert not in set(ids.flatten().tolist())
 
 
 def test_drop_zeroes_dead_slots_and_loses_gate_mass(profile, routing_inputs):
@@ -619,3 +658,223 @@ def test_verify_math500_rejects_a_scoreless_report(sweep_mod, tmp_path):
     _write_report(tmp_path, score=None)
     with pytest.raises(RuntimeError, match="no score"):
         sweep_mod._verify_math500(tmp_path, sweep_mod.EXPECTED_MATH500_N)
+
+
+# --------------------------------------------------------------------------
+# BFCL result verification
+#
+# Same failure mode as MATH-500, one process further away: BFCL runs in its own
+# interpreter, so the only evidence a cell produced is the summary file it left
+# behind. These tests cover the reader and the completeness guard, because the
+# "within 5%" conclusion is only as good as the refusal to score a partial run.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def bfcl_client_mod():
+    """Load reap/bfcl_client/__main__.py by path.
+
+    It runs under the separate ``.venv-bfcl`` interpreter and deliberately
+    imports ``bfcl_eval`` lazily, inside functions -- so its module level is
+    stdlib-only and ``read_scores`` is testable from this environment, where
+    ``bfcl_eval`` is not installed.
+    """
+    import importlib.util
+    import pathlib
+
+    path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "reap"
+        / "bfcl_client"
+        / "__main__.py"
+    )
+    spec = importlib.util.spec_from_file_location("reap_bfcl_client", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _write_bfcl_score(score_dir, registry_name, category, accuracy, correct, total):
+    """Write a score file the way ``eval_runner_helper.save_eval_results`` does.
+
+    JSON *lines*: a header holding the aggregate, then one entry per failure.
+    The reader must take the header and ignore the rest.
+    """
+    import json
+
+    model_dir = score_dir / registry_name.replace("/", "_") / "non_live"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps({"accuracy": accuracy, "correct_count": correct, "total_count": total})]
+    lines += [json.dumps({"id": f"{category}_{i}", "valid": False}) for i in range(total - correct)]
+    (model_dir / f"BFCL_v4_{category}_score.json").write_text("\n".join(lines) + "\n")
+
+
+def test_read_scores_parses_the_header_line(bfcl_client_mod, tmp_path):
+    score_dir = tmp_path / "score"
+    name = bfcl_client_mod.REGISTRY_NAME
+    _write_bfcl_score(score_dir, name, "simple_python", 0.9, 360, 400)
+    _write_bfcl_score(score_dir, name, "irrelevance", 0.8, 192, 240)
+
+    out = bfcl_client_mod.read_scores(score_dir, ["simple_python", "irrelevance"])
+
+    assert out["categories"]["simple_python"]["accuracy"] == 0.9
+    assert out["total_count"] == 640
+    assert out["correct_count"] == 552
+    # Entry-weighted, not the leaderboard's unweighted category mean.
+    assert out["overall_accuracy"] == pytest.approx(552 / 640)
+    assert out["num_categories_scored"] == 2
+
+
+def test_read_scores_reports_a_missing_category_as_none(bfcl_client_mod, tmp_path):
+    """"Never ran" must be distinguishable from "scored zero"."""
+    score_dir = tmp_path / "score"
+    _write_bfcl_score(score_dir, bfcl_client_mod.REGISTRY_NAME, "parallel", 0.0, 0, 200)
+
+    out = bfcl_client_mod.read_scores(score_dir, ["parallel", "multiple"])
+
+    assert out["categories"]["parallel"]["accuracy"] == 0.0
+    assert out["categories"]["multiple"] is None
+    assert out["num_categories_scored"] == 1
+    assert out["num_categories_requested"] == 2
+
+
+def test_registry_name_survives_bfcls_underscore_round_trip(bfcl_client_mod):
+    """BFCL turns "/" into "_" for paths and back again to look the config up.
+
+    ``generate_leaderboard_csv`` does ``model_name.replace("_", "/")`` on the
+    directory name, so a registry name containing any other underscore comes
+    back mangled and the lookup raises KeyError at the very end of a run --
+    after all the generation cost has been paid.
+    """
+    name = bfcl_client_mod.REGISTRY_NAME
+    assert name.count("_") == 0
+    assert name.replace("/", "_").replace("_", "/") == name
+
+
+def test_verify_bfcl_summary_rejects_a_truncated_run():
+    from reap.bfcl import EXPECTED_NON_LIVE_N, verify_bfcl_summary
+
+    summary = {
+        "categories": {"simple_python": {"accuracy": 0.9, "total_count": 400}},
+        "overall_accuracy": 0.9,
+        "total_count": 400,
+    }
+    with pytest.raises(RuntimeError, match="scored 400 entries, expected 1390"):
+        verify_bfcl_summary(summary, EXPECTED_NON_LIVE_N)
+
+    # Escapable when a subset is genuinely intended.
+    assert verify_bfcl_summary(summary, None)["total_count"] == 400
+
+
+def test_verify_bfcl_summary_rejects_a_missing_category():
+    from reap.bfcl import verify_bfcl_summary
+
+    summary = {
+        "categories": {
+            "simple_python": {"accuracy": 0.9, "total_count": 400},
+            "parallel": None,
+        },
+        "overall_accuracy": 0.9,
+        "total_count": 400,
+    }
+    with pytest.raises(RuntimeError, match="no score for categories"):
+        verify_bfcl_summary(summary, None)
+
+
+def test_split_server_url_handles_the_forms_the_harness_passes():
+    """BFCL wants host and port apart; the harness passes base URLs."""
+    from reap.bfcl import _split_server_url
+
+    assert _split_server_url("http://0.0.0.0:8000") == ("0.0.0.0", "8000")
+    assert _split_server_url("http://localhost:8003/v1") == ("localhost", "8003")
+    assert _split_server_url("https://host:9000/") == ("host", "9000")
+    assert _split_server_url("127.0.0.1") == ("127.0.0.1", "8000")
+
+
+def test_sweep_verify_cell_reads_the_bfcl_summary(sweep_mod, tmp_path):
+    """The sweep must read BFCL's score off disk, as it does for MATH-500."""
+    import argparse
+    import json
+
+    (tmp_path / "bfcl").mkdir()
+    (tmp_path / "bfcl" / "bfcl_summary.json").write_text(
+        json.dumps(
+            {
+                "categories": {
+                    "simple_python": {"accuracy": 0.9, "total_count": 400},
+                    "irrelevance": {"accuracy": 0.8, "total_count": 240},
+                },
+                "overall_accuracy": 0.8625,
+                "total_count": 640,
+            }
+        )
+    )
+    args = argparse.Namespace(benchmark="bfcl", expect_n=0)
+
+    out = sweep_mod._verify_cell(tmp_path, args)
+
+    assert out["score"] == 0.8625
+    assert out["num"] == 640
+    assert out["categories"]["simple_python"] == 0.9
+
+
+def test_sweep_verify_cell_fails_on_a_missing_bfcl_summary(sweep_mod, tmp_path):
+    import argparse
+
+    args = argparse.Namespace(benchmark="bfcl", expect_n=0)
+    with pytest.raises(RuntimeError, match="no BFCL summary"):
+        sweep_mod._verify_cell(tmp_path, args)
+
+
+def test_sweep_expect_n_defaults_cover_both_benchmarks(sweep_mod):
+    """A benchmark added without an expected size would silently accept any run."""
+    assert set(sweep_mod.DEFAULT_EXPECT_N) == set(sweep_mod.BENCHMARKS)
+    assert sweep_mod.DEFAULT_EXPECT_N["math_500"] == 500
+    assert sweep_mod.DEFAULT_EXPECT_N["bfcl"] == 1390
+
+
+def test_eval_args_for_selects_exactly_one_benchmark(sweep_mod):
+    """One benchmark on, everything else off -- and the dataclass must accept it.
+
+    Regression guard: the shared-defaults dict and the per-benchmark overrides
+    both used to name `run_math`/`run_bfcl`, which raised "got multiple values
+    for keyword argument" only when a cell actually started.
+    """
+    import argparse
+
+    base = dict(
+        port=8000,
+        parallel_tasks=32,
+        bfcl_test_category=["non_live"],
+        bfcl_num_threads=32,
+        bfcl_enable_thinking=False,
+        bfcl_python=None,
+    )
+
+    math_args = sweep_mod._eval_args_for(
+        argparse.Namespace(benchmark="math_500", **base), "http://0.0.0.0:8000"
+    )
+    assert math_args.run_math and not math_args.run_bfcl
+    assert math_args.math_tasks == ["math_500"]
+
+    bfcl_args = sweep_mod._eval_args_for(
+        argparse.Namespace(benchmark="bfcl", **base), "http://0.0.0.0:8000"
+    )
+    assert bfcl_args.run_bfcl and not bfcl_args.run_math
+    assert bfcl_args.bfcl_test_categories == ["non_live"]
+
+    for eval_args in (math_args, bfcl_args):
+        # `strict` is what turns a silently-skipped benchmark into a failed
+        # cell, and `existing_server_url` is what keeps one server boot serving
+        # the whole sweep. Both are load-bearing.
+        assert eval_args.strict is True
+        assert eval_args.existing_server_url == "http://0.0.0.0:8000"
+        assert not any(
+            (
+                eval_args.run_lm_eval,
+                eval_args.run_evalplus,
+                eval_args.run_livecodebench,
+                eval_args.run_wildbench,
+            )
+        )

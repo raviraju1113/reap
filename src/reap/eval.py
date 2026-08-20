@@ -414,6 +414,40 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
             if getattr(eval_args, "strict", False):
                 raise
 
+    if getattr(eval_args, "run_bfcl", False):
+        try:
+            if not use_server:
+                raise ValueError(
+                    "BFCL drives the model over the OpenAI completions API; it "
+                    "needs a vLLM server (use_server=True)."
+                )
+            from reap.bfcl import run_bfcl
+
+            summary = run_bfcl(
+                # The served-model-name, which must match exactly -- vLLM
+                # compares literally, so a trailing slash 404s every request.
+                model_path=model_name,
+                results_dir=results_dir,
+                server_url=server_endpoint,
+                test_categories=list(
+                    getattr(eval_args, "bfcl_test_categories", None) or ["non_live"]
+                ),
+                bfcl_python=getattr(eval_args, "bfcl_python", None),
+                num_threads=getattr(eval_args, "bfcl_num_threads", 32),
+                enable_thinking=getattr(eval_args, "bfcl_enable_thinking", False),
+            )
+            logger.info(
+                "Finished BFCL: overall=%s over %s entries",
+                summary.get("overall_accuracy"),
+                summary.get("total_count"),
+            )
+        except Exception as e:
+            logger.error(f"An error occurred during BFCL evaluation: {e}")
+            # As with the math path: swallowing by default keeps one bad
+            # benchmark from aborting a suite, but a sweep needs the opposite.
+            if getattr(eval_args, "strict", False):
+                raise
+
     # Only tear down a server this call started; an `existing_server_url` server
     # belongs to the caller (see the node-failure sweep) and must outlive us.
     if process is not None:

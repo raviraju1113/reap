@@ -8,12 +8,16 @@ cluster required.
 | Model | Experts | Per node | MoE layers | Routing |
 |---|---|---|---|---|
 | **Qwen3-30B-A3B** (primary) | 128, top-8 | **4** | 48 (all) | `softmax` + `fused_topk` |
+| **GLM-4.5-Air** | 128, top-8 | **4** | 45 (1–45) | `sigmoid` + `grouped_topk` (`noaux_tc`) |
 | Kimi-K2.6 | 384, top-8 | 12 | 60 (1–60) | `sigmoid` + `grouped_topk` (`noaux_tc`) |
 
-Both drop **1/32 = 3.125%** of routed experts per node and both route top-8, so the
+All three drop **1/32 = 3.125%** of routed experts per node and all route top-8, so the
 per-token failure statistics are identical — `1 - (1 - 1/32)^8 = 22.4%` of tokens lose at
 least one expert. Qwen3-30B-A3B is a faithful and far cheaper stand-in for the K2.6
-experiment.
+experiment; GLM-4.5-Air combines Qwen3's expert count with K2.6's exact routing path
+(`grouped_topk` + sigmoid + correction bias) and adds K2.6's shared expert, making it the
+closer proxy of the two. It is swept on **BFCL** rather than MATH-500 —
+see [GLM45-AIR-BFCL.md](./GLM45-AIR-BFCL.md).
 
 See [PLAN.md](./PLAN.md) for the design rationale, cost model and fidelity caveats.
 
@@ -23,11 +27,18 @@ See [PLAN.md](./PLAN.md) for the design rationale, cost model and fidelity cavea
 |---|---|---|
 | [`src/reap/expert_failure.py`](../../src/reap/expert_failure.py) | new | The routing mask. Patches `FusedMoE.select_experts`; implements the three semantics; tracks routing counters. |
 | [`src/reap/expert_failure_server.py`](../../src/reap/expert_failure_server.py) | new | vLLM OpenAI server + `GET/POST /reap/failure` control plane, so the mask changes without a restart. |
-| [`sweep.py`](./sweep.py) | new | Resumable, sharded driver over (mode × node) cells. |
-| [`tests/test_expert_failure.py`](../../tests/test_expert_failure.py) | new | 35 tests of the masking math against the real vLLM router, on **both** routing paths. No weights needed. |
+| [`sweep.py`](./sweep.py) | new | Resumable, sharded driver over (mode × node) cells. `--benchmark math_500|bfcl`. |
+| [`report.py`](./report.py) | new | Per-node delta against the measured baseline, in sigma. |
+| [`heatmap.py`](./heatmap.py) | new | The sweep as a grid heatmap of the EP expert layout, light + dark. |
+| [`BFCL-RUNBOOK.md`](./BFCL-RUNBOOK.md) | new | **How to run BFCL**, standalone or in the sweep. Start here for BFCL. |
+| [`scripts/setup_bfcl.sh`](../../scripts/setup_bfcl.sh) | new | One-time BFCL setup: sparse submodule + isolated interpreter. |
+| [`src/reap/bfcl.py`](../../src/reap/bfcl.py) | new | Runs BFCL against the live server, in its own interpreter. |
+| [`src/reap/bfcl_client/`](../../src/reap/bfcl_client/) | new | The BFCL-side client: model registration + prompting handler. |
+| [`GLM45-AIR-BFCL.md`](./GLM45-AIR-BFCL.md) | new | The GLM-4.5-Air / BFCL sweep: topology, serving, wiring, results. |
+| [`tests/test_expert_failure.py`](../../tests/test_expert_failure.py) | new | 57 tests of the masking math against the real vLLM router, on **all three** routing profiles, plus the result readers. No weights needed. |
 | [`pyproject.toml`](../../pyproject.toml) | +3 lines | Registers the `expert_failure` plugin entry point. |
-| [`src/reap/args.py`](../../src/reap/args.py) | +3 fields | `EvalArgs.existing_server_url`, `.math_tasks`, `.strict`. |
-| [`src/reap/eval.py`](../../src/reap/eval.py) | ~20 lines | Honour those three fields. No behaviour change when unset. |
+| [`src/reap/args.py`](../../src/reap/args.py) | +8 fields | `EvalArgs.existing_server_url`, `.math_tasks`, `.strict`, and the `run_bfcl` / `bfcl_*` group. |
+| [`src/reap/eval.py`](../../src/reap/eval.py) | ~50 lines | Honour those fields, and dispatch to BFCL. No behaviour change when unset. |
 
 ## How it works
 

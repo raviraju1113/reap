@@ -5,13 +5,32 @@ setting the dead-expert mask between cells over the ``/reap/failure`` control
 plane exposed by ``reap.expert_failure_server``. That is what makes the sweep
 affordable: a 32-node sweep costs one checkpoint load rather than 32.
 
-For Qwen3-30B-A3B (128 experts / 32 nodes = 4 per node) the default matrix is
-32 nodes x 2 modes (``drop_renorm``, ``reroute``) = 64 cells. At ~61 GB in bf16
-the model fits on a single B200, so the cheapest layout is **one server per GPU**
-and ``--shard`` to split the cell list across them. Measured at ~27.5 min per
-cell, 8-way parallelism puts the full sweep at roughly 4 hours.
+Two benchmarks are supported, selected with ``--benchmark``:
 
-Typical use, single GPU::
+``math_500``
+    evalscope MATH-500, 500 problems. The original Qwen3-30B-A3B sweep.
+``bfcl``
+    Berkeley Function-Calling Leaderboard, ``non_live`` by default: 1390
+    entries across 7 categories. Runs in a separate interpreter -- see
+    ``reap.bfcl``.
+
+The two models swept with this driver both have 128 routed experts at top-8, so
+32 nodes means 4 dead experts per node either way (K2.6, the original target, is
+supported by the mask but was never affordable to sweep):
+
+===================  ============  ==========  =============  ===============
+Model                Experts       Per node    MoE layers     Routing
+===================  ============  ==========  =============  ===============
+Qwen3-30B-A3B        128, top-8    4           48 (all)       softmax topk
+GLM-4.5-Air          128, top-8    4           45 (1..45)     sigmoid noaux_tc
+===================  ============  ==========  =============  ===============
+
+Qwen3-30B-A3B is ~61 GB in bf16 and fits on one B200, so the cheapest layout is
+one server per GPU with ``--shard`` splitting the cell list 8 ways. GLM-4.5-Air
+is ~214 GB and needs ``--tensor-parallel-size 2``, giving 4 shards on an 8-GPU
+box.
+
+Typical use, single server::
 
     # terminal 1 -- boot once, leave up for the whole sweep
     CUDA_VISIBLE_DEVICES=0 python -m reap.expert_failure_server \\
@@ -36,10 +55,24 @@ into the same results tree::
           --baseline-repeats 2 &
     done
 
+GLM-4.5-Air on BFCL, 4 shards of TP=2::
+
+    MODEL=/sms-scratch/checkpoints/GLM-4.5-Air   # no trailing slash
+    for i in 0 1 2 3; do
+      CUDA_VISIBLE_DEVICES=$((2*i)),$((2*i+1)) python -m reap.expert_failure_server \\
+          --model $MODEL --tensor-parallel-size 2 --enable-expert-parallel \\
+          --max-model-len 32768 --port $((8000+i)) &
+    done
+    for i in 0 1 2 3; do
+      python experiments/node-failure/sweep.py --model $MODEL \\
+          --port $((8000+i)) --benchmark bfcl --modes reroute \\
+          --shard $i --num-shards 4 --baseline-repeats 2 &
+    done
+
 Results land in ``<results-dir>/<mode>/node_<k>/`` with a ``cell.json`` holding
-the routing counters. The driver is resumable: a cell whose ``cell.json``
-exists is skipped, so an interrupted sweep restarts where it stopped. That also
-makes sharding safe to redo with a different shard count.
+the score and the routing counters. The driver is resumable: a cell whose
+``cell.json`` exists is skipped, so an interrupted sweep restarts where it
+stopped. That also makes sharding safe to redo with a different shard count.
 """
 
 from __future__ import annotations
@@ -56,6 +89,7 @@ import requests
 # Import from the installed package rather than relative paths so this runs
 # the same whether invoked as a script or a module.
 from reap.args import EvalArgs, ModelArgs
+from reap.bfcl import EXPECTED_NON_LIVE_N, verify_bfcl_summary
 from reap.eval import run_evaluate
 from reap.expert_failure import DEFAULT_NUM_EXPERTS, DEFAULT_NUM_NODES, experts_for_node
 
@@ -119,6 +153,12 @@ def check_server(base_url: str) -> None:
 
 EXPECTED_MATH500_N = 500
 
+# Per-benchmark default for --expect-n, the "did this cell really run the whole
+# benchmark?" guard. A cell that scored fewer problems than the baseline is not
+# comparable to it, so a short run is an error rather than a datapoint.
+BENCHMARKS = ("math_500", "bfcl")
+DEFAULT_EXPECT_N = {"math_500": EXPECTED_MATH500_N, "bfcl": EXPECTED_NON_LIVE_N}
+
 
 def read_evalscope_report(cell_dir: pathlib.Path, task: str) -> dict:
     """Parse the evalscope report for ``task`` under ``cell_dir``.
@@ -163,6 +203,82 @@ def _verify_math500(cell_dir: pathlib.Path, expect_n: int | None) -> dict:
             f"baseline -- pass --expect-n 0 to disable this check."
         )
     return result
+
+
+def _eval_args_for(args: argparse.Namespace, base_url: str) -> EvalArgs:
+    """Build the harness config for one cell.
+
+    Everything except the selected benchmark is switched off, and
+    ``existing_server_url`` keeps ``run_evaluate`` from booting (and killing) a
+    server of its own, so every cell reuses the one checkpoint load. ``strict``
+    makes a broken benchmark fail the cell instead of completing it empty.
+    """
+    common = dict(
+        use_server=True,
+        existing_server_url=base_url,
+        run_lm_eval=False,
+        run_evalplus=False,
+        run_livecodebench=False,
+        run_wildbench=False,
+        strict=True,
+        greedy=True,
+        vllm_port=args.port,
+        parallel_tasks=args.parallel_tasks,
+    )
+    if args.benchmark == "math_500":
+        return EvalArgs(
+            **common,
+            run_math=True,
+            run_bfcl=False,
+            # The default is gsm8k+math_500, which would add 1319 problems per
+            # cell for a benchmark this sweep does not report.
+            math_tasks=["math_500"],
+        )
+    return EvalArgs(
+        **common,
+        run_math=False,
+        run_bfcl=True,
+        bfcl_test_categories=list(args.bfcl_test_category),
+        bfcl_num_threads=args.bfcl_num_threads,
+        bfcl_enable_thinking=args.bfcl_enable_thinking,
+        bfcl_python=args.bfcl_python,
+    )
+
+
+def _verify_cell(cell_dir: pathlib.Path, args: argparse.Namespace) -> dict:
+    """Read the benchmark's own artifact back off disk and confirm it is real.
+
+    ``run_evaluate`` cannot be trusted to have run anything -- it catches
+    per-benchmark exceptions and returns normally -- so the score is read from
+    the artifact rather than from a return value. Returns
+    ``{"score": float, "num": int, "report": str}`` for either benchmark, which
+    is what ``cell.json`` records.
+    """
+    if args.benchmark == "math_500":
+        result = _verify_math500(cell_dir, args.expect_n)
+        return {"score": result["score"], "num": result["num"], "report": result["report"]}
+
+    summary_path = cell_dir / "bfcl" / "bfcl_summary.json"
+    if not summary_path.exists():
+        raise RuntimeError(
+            f"no BFCL summary at {summary_path}. The benchmark did not run to "
+            f"completion; check {cell_dir / 'bfcl' / 'bfcl_run.log'}."
+        )
+    summary = json.loads(summary_path.read_text())
+    verify_bfcl_summary(summary, args.expect_n or None)
+    return {
+        "score": summary["overall_accuracy"],
+        "num": summary["total_count"],
+        "report": str(summary_path),
+        # Per-category accuracy, kept because a routing perturbation need not
+        # hurt all seven categories equally, and the pooled score would hide
+        # that. Observed on GLM-4.5-Air: `irrelevance` moves several times more
+        # than the pooled number does.
+        "categories": {
+            name: (value or {}).get("accuracy")
+            for name, value in summary.get("categories", {}).items()
+        },
+    }
 
 
 def _completion(base_url: str, model: str, prompt: str, max_tokens: int = 48) -> str:
@@ -292,25 +408,7 @@ def run_cell(
         state.get("dead_experts", [])[:4],
     )
 
-    # `existing_server_url` keeps run_evaluate from booting (and killing) its own
-    # server, so every cell reuses the one load of the checkpoint.
-    eval_args = EvalArgs(
-        use_server=True,
-        existing_server_url=base_url,
-        run_lm_eval=False,
-        run_evalplus=False,
-        run_livecodebench=False,
-        run_wildbench=False,
-        run_math=True,
-        # MATH-500 only. The default is gsm8k+math_500, which would add 1319
-        # problems per cell for a benchmark this sweep does not report.
-        math_tasks=["math_500"],
-        # Fail the cell instead of recording an empty one.
-        strict=True,
-        greedy=True,
-        vllm_port=args.port,
-        parallel_tasks=args.parallel_tasks,
-    )
+    eval_args = _eval_args_for(args, base_url)
     model_args = ModelArgs(model_name=model)
 
     start = time.time()
@@ -323,7 +421,7 @@ def run_cell(
     elapsed = time.time() - start
 
     # Read the score back off disk rather than trusting run_evaluate's return.
-    math500 = _verify_math500(cell_dir, args.expect_n)
+    score = _verify_cell(cell_dir, args)
 
     # Routing counters are only meaningful after the eval traffic has run.
     routing = get_failure(base_url)
@@ -338,20 +436,23 @@ def run_cell(
     record = {
         "mode": mode,
         "node_id": node_id,
+        "benchmark": args.benchmark,
         "elapsed_s": round(elapsed, 1),
         "seed": args.seed,
-        "math_500": {k: math500[k] for k in ("score", "num", "report")},
+        # Keyed by benchmark name so a results tree holding both is unambiguous.
+        args.benchmark: score,
         "routing": routing,
     }
     result_file.write_text(json.dumps(record, indent=2))
     logger.info(
-        "cell mode=%s node=%s done in %.0f min: math_500=%.4f (n=%d), "
+        "cell mode=%s node=%s done in %.0f min: %s=%.4f (n=%d), "
         "dead_slot_rate=%.4f, lost_gate_mass=%.4f",
         mode,
         node_id,
         elapsed / 60,
-        math500["score"],
-        math500["num"],
+        args.benchmark,
+        score["score"],
+        score["num"],
         routing.get("dead_slot_rate", 0.0),
         routing.get("lost_gate_mass_frac", 0.0),
     )
@@ -385,6 +486,40 @@ def main() -> int:
     p.add_argument("--num-experts", type=int, default=DEFAULT_NUM_EXPERTS)
     p.add_argument("--num-nodes", type=int, default=DEFAULT_NUM_NODES)
     p.add_argument(
+        "--benchmark",
+        default="math_500",
+        choices=BENCHMARKS,
+        help="`math_500` (evalscope, 500 problems) or `bfcl` (Berkeley "
+        "Function-Calling Leaderboard, 1390 non-live entries). BFCL runs in a "
+        "separate interpreter; see reap.bfcl for the one-time setup.",
+    )
+    p.add_argument(
+        "--bfcl-test-category",
+        nargs="+",
+        default=["non_live"],
+        help="BFCL categories or collections when --benchmark bfcl. Default "
+        "`non_live` is the 7-category V1 AST set. Changing this changes the "
+        "entry count, so pass a matching --expect-n (or 0).",
+    )
+    p.add_argument(
+        "--bfcl-num-threads",
+        type=int,
+        default=32,
+        help="concurrent BFCL requests; keep at or below the server's "
+        "--max-num-seqs",
+    )
+    p.add_argument(
+        "--bfcl-enable-thinking",
+        action="store_true",
+        help="leave GLM reasoning mode on. Off by default; must be identical "
+        "across baseline and masked cells either way.",
+    )
+    p.add_argument(
+        "--bfcl-python",
+        default=None,
+        help="interpreter with bfcl_eval installed (default .venv-bfcl/bin/python)",
+    )
+    p.add_argument(
         "--baseline-repeats",
         type=int,
         default=2,
@@ -405,9 +540,11 @@ def main() -> int:
     p.add_argument(
         "--expect-n",
         type=int,
-        default=EXPECTED_MATH500_N,
-        help="fail a cell whose MATH-500 report does not cover this many problems "
-        "(0 disables). Guards against a truncated run being compared to a full baseline.",
+        default=None,
+        help="fail a cell whose report does not cover this many problems "
+        "(0 disables). Defaults to the benchmark's full size -- 500 for "
+        "MATH-500, 1390 for BFCL non-live. Guards against a truncated run being "
+        "compared to a full baseline.",
     )
     p.add_argument(
         "--preflight",
@@ -423,6 +560,15 @@ def main() -> int:
     args = p.parse_args()
     if args.preflight_only:
         args.preflight = True
+    if args.expect_n is None:
+        args.expect_n = DEFAULT_EXPECT_N[args.benchmark]
+
+    if args.benchmark == "bfcl":
+        # Fail here rather than after the first cell's generation pass: the
+        # missing interpreter is a setup problem, not a run-time one.
+        from reap.bfcl import resolve_bfcl_python
+
+        logger.info("BFCL interpreter: %s", resolve_bfcl_python(args.bfcl_python))
 
     if not 0 <= args.shard < args.num_shards:
         raise SystemExit(f"--shard must be in [0, {args.num_shards}), got {args.shard}")
@@ -454,8 +600,9 @@ def main() -> int:
     cells = all_cells[args.shard :: args.num_shards]
 
     logger.info(
-        "sweep: %d baseline + %d mode(s) x %d node(s) = %d cells total; "
+        "sweep on %s: %d baseline + %d mode(s) x %d node(s) = %d cells total; "
         "shard %d/%d runs %d of them",
+        args.benchmark,
         args.baseline_repeats,
         len(args.modes),
         len(nodes),

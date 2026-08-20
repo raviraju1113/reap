@@ -441,6 +441,56 @@ class EvalArgs:
             )
         },
     )
+    run_bfcl: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to run the Berkeley Function-Calling Leaderboard. "
+                "Requires a server (`use_server`) and the separate BFCL "
+                "interpreter -- see `reap.bfcl` for the one-time setup."
+            )
+        },
+    )
+    bfcl_test_categories: list[str] = field(
+        default_factory=lambda: ["non_live"],
+        metadata={
+            "help": (
+                "BFCL categories or collections. `non_live` is the 7-category, "
+                "1390-entry V1 AST set (simple python/java/js, multiple, "
+                "parallel, parallel_multiple, irrelevance). `live` and "
+                "`multi_turn` are the newer, much larger sets."
+            )
+        },
+    )
+    bfcl_python: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Interpreter with `bfcl_eval` installed. Defaults to "
+                "`.venv-bfcl/bin/python` at the repo root. BFCL cannot share "
+                "this environment: it pins numpy 1.26 against vLLM's 2.x."
+            )
+        },
+    )
+    bfcl_num_threads: int = field(
+        default=32,
+        metadata={
+            "help": (
+                "Concurrent BFCL requests. Keep at or below the server's "
+                "--max-num-seqs; BFCL's own default of 100 would just queue."
+            )
+        },
+    )
+    bfcl_enable_thinking: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Leave GLM-style reasoning mode on for BFCL. Off by default: "
+                "the answer is a single function call, and traces multiply "
+                "per-cell cost. Must be identical across every swept cell."
+            )
+        },
+    )
     strict: bool = field(
         default=False,
         metadata={

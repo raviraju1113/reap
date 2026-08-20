@@ -26,3 +26,11 @@ pruning_env_5/
 credentials.json
 config/wildbench_prod_env_*
 cmd.sh
+
+# BFCL runs in its own interpreter (it pins numpy 1.26 against vLLM's 2.x).
+.venv-bfcl
+# BFCL writes result/, score/ and .file_locks/ under its BFCL_PROJECT_ROOT; the
+# default root is the vendored checkout, so keep its output out of the tree.
+third-party/gorilla/berkeley-function-call-leaderboard/result/
+third-party/gorilla/berkeley-function-call-leaderboard/score/
+third-party/gorilla/berkeley-function-call-leaderboard/.file_locks/
