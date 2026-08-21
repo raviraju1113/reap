@@ -7,9 +7,9 @@ exercise: a 3.125% expert loss is a small perturbation, so "is this drop real?"
 is a question about the noise floor, and a table of raw deltas invites reading
 run-to-run scatter as a finding.
 
-Works for either benchmark -- the cell records name their score under the
-benchmark key (``math_500`` or ``bfcl``), so the reader takes whichever is
-present.
+Works for any of the swept benchmarks -- the cell records name their score
+under the benchmark key (``math_500``, ``bfcl`` or ``livecodebench``), so the
+reader takes whichever is present.
 
 Usage::
 
@@ -28,7 +28,7 @@ import statistics
 import sys
 
 # Keys a cell record may carry its score under, in the order tried.
-SCORE_KEYS = ("bfcl", "math_500")
+SCORE_KEYS = ("bfcl", "livecodebench", "math_500")
 
 
 def load_cells(results_dir: pathlib.Path) -> list[dict]:

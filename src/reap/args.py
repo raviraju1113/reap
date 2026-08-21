@@ -491,6 +491,86 @@ class EvalArgs:
             )
         },
     )
+    lcb_release_version: str = field(
+        default="release_latest",
+        metadata={
+            "help": (
+                "`livecodebench/code_generation_lite` release tag. The pinned "
+                "dataset's `release_latest` covers 2023-09 through 2025-04."
+            )
+        },
+    )
+    lcb_start_date: str | None = field(
+        default="2024-08-01",
+        metadata={
+            "help": (
+                "Earliest contest date to include, `YYYY-MM-DD`. Together with "
+                "`lcb_end_date` this fixes the problem count, and so the noise "
+                "floor: 2024-08-01 onwards is 454 problems (the LCB v5+v6 "
+                "window), 2025-01-01 onwards is 182. Must be identical across "
+                "every cell of a sweep."
+            )
+        },
+    )
+    lcb_end_date: str | None = field(
+        default="2025-07-31",
+        metadata={"help": "Latest contest date to include, `YYYY-MM-DD`."},
+    )
+    lcb_n: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Samples per problem. pass@1 over n=1 is what the sweep "
+                "compares; n>1 costs proportionally more for a metric the "
+                "reporting does not use."
+            )
+        },
+    )
+    lcb_max_tokens: int = field(
+        default=16384,
+        metadata={
+            "help": (
+                "Generation ceiling per problem. Generous for non-thinking code "
+                "generation; it mainly bounds how long a degenerate, repeating "
+                "generation can run under a routing mask."
+            )
+        },
+    )
+    lcb_num_threads: int = field(
+        default=32,
+        metadata={
+            "help": (
+                "Concurrent LiveCodeBench requests. Keep at or below the "
+                "server's --max-num-seqs: upstream fires every prompt at once, "
+                "which leaves hundreds of requests queueing against a "
+                "client-side timeout that retries forever."
+            )
+        },
+    )
+    lcb_num_process_evaluate: int = field(
+        default=12,
+        metadata={
+            "help": (
+                "Worker processes for grading. Grading executes "
+                "model-generated code, so these are subprocesses running "
+                "untrusted programs."
+            )
+        },
+    )
+    lcb_timeout: int = field(
+        default=120,
+        metadata={"help": "Per-test execution timeout, in seconds, during grading."},
+    )
+    lcb_enable_thinking: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Leave GLM-style reasoning mode on for LiveCodeBench. Off by "
+                "default, matching the BFCL sweep; must be identical across "
+                "every swept cell either way."
+            )
+        },
+    )
     strict: bool = field(
         default=False,
         metadata={

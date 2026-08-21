@@ -827,11 +827,44 @@ def test_sweep_verify_cell_fails_on_a_missing_bfcl_summary(sweep_mod, tmp_path):
         sweep_mod._verify_cell(tmp_path, args)
 
 
-def test_sweep_expect_n_defaults_cover_both_benchmarks(sweep_mod):
+def test_sweep_expect_n_defaults_cover_every_benchmark(sweep_mod):
     """A benchmark added without an expected size would silently accept any run."""
-    assert set(sweep_mod.DEFAULT_EXPECT_N) == set(sweep_mod.BENCHMARKS)
-    assert sweep_mod.DEFAULT_EXPECT_N["math_500"] == 500
-    assert sweep_mod.DEFAULT_EXPECT_N["bfcl"] == 1390
+    import argparse
+
+    def expect(benchmark, **kw):
+        return sweep_mod.default_expect_n(
+            argparse.Namespace(benchmark=benchmark, **kw)
+        )
+
+    assert expect("math_500") == 500
+    assert expect("bfcl") == 1390
+    # LiveCodeBench's size is set by the contest window, not by the benchmark.
+    assert expect(
+        "livecodebench", lcb_start_date="2024-08-01", lcb_end_date="2025-07-31"
+    ) == 454
+    assert expect(
+        "livecodebench", lcb_start_date="2025-01-01", lcb_end_date="2025-07-31"
+    ) == 182
+    # Every benchmark is covered: either by the constant table or by the window
+    # lookup. A new one would raise KeyError here rather than pass silently.
+    for benchmark in sweep_mod.BENCHMARKS:
+        expect(benchmark, lcb_start_date="2024-08-01", lcb_end_date="2025-07-31")
+
+
+def test_sweep_expect_n_disables_itself_on_an_unmeasured_window(sweep_mod):
+    """An invented count would be worse than no check: every cell would fail."""
+    import argparse
+
+    assert (
+        sweep_mod.default_expect_n(
+            argparse.Namespace(
+                benchmark="livecodebench",
+                lcb_start_date="2023-09-01",
+                lcb_end_date="2025-07-31",
+            )
+        )
+        == 0
+    )
 
 
 def test_eval_args_for_selects_exactly_one_benchmark(sweep_mod):
@@ -850,6 +883,14 @@ def test_eval_args_for_selects_exactly_one_benchmark(sweep_mod):
         bfcl_num_threads=32,
         bfcl_enable_thinking=False,
         bfcl_python=None,
+        lcb_release_version="release_latest",
+        lcb_start_date="2024-08-01",
+        lcb_end_date="2025-07-31",
+        lcb_max_tokens=16384,
+        lcb_num_threads=32,
+        lcb_num_process_evaluate=12,
+        lcb_timeout=120,
+        lcb_enable_thinking=False,
     )
 
     math_args = sweep_mod._eval_args_for(
@@ -864,17 +905,511 @@ def test_eval_args_for_selects_exactly_one_benchmark(sweep_mod):
     assert bfcl_args.run_bfcl and not bfcl_args.run_math
     assert bfcl_args.bfcl_test_categories == ["non_live"]
 
-    for eval_args in (math_args, bfcl_args):
+    lcb_args = sweep_mod._eval_args_for(
+        argparse.Namespace(benchmark="livecodebench", **base), "http://0.0.0.0:8000"
+    )
+    assert lcb_args.run_livecodebench and not (lcb_args.run_math or lcb_args.run_bfcl)
+    assert lcb_args.lcb_start_date == "2024-08-01"
+
+    selectors = (
+        "run_lm_eval",
+        "run_evalplus",
+        "run_wildbench",
+        "run_math",
+        "run_bfcl",
+        "run_livecodebench",
+    )
+    for eval_args, expected in (
+        (math_args, "run_math"),
+        (bfcl_args, "run_bfcl"),
+        (lcb_args, "run_livecodebench"),
+    ):
         # `strict` is what turns a silently-skipped benchmark into a failed
         # cell, and `existing_server_url` is what keeps one server boot serving
         # the whole sweep. Both are load-bearing.
         assert eval_args.strict is True
         assert eval_args.existing_server_url == "http://0.0.0.0:8000"
-        assert not any(
-            (
-                eval_args.run_lm_eval,
-                eval_args.run_evalplus,
-                eval_args.run_livecodebench,
-                eval_args.run_wildbench,
-            )
+        # Exactly one benchmark per cell: a second would double the cell cost
+        # and pollute the routing counters the cell records.
+        assert [name for name in selectors if getattr(eval_args, name)] == [expected]
+
+
+# --------------------------------------------------------------------------
+# LiveCodeBench result verification
+#
+# LCB is the third benchmark on this sweep and the only one that *grades by
+# execution*, which gives it a failure mode the other two do not have: a
+# generation that never arrived, and a generation that arrived carrying no code
+# block, both land in the score as a wrong answer. One is an infrastructure
+# failure and the other is a model failure, and a sweep that cannot tell them
+# apart will read a server hiccup as node degradation. Hence the counting.
+# --------------------------------------------------------------------------
+
+
+def _write_lcb_artifacts(cell_dir, instances, pass_at_1=None):
+    """Write the two files ``lcb_main`` leaves behind, in its own shapes.
+
+    ``<...>_eval.json`` is the ``[metrics, results, metadatas]`` triple whose
+    first element holds ``pass@1`` plus a per-problem ``detail``;
+    ``<...>_eval_all.json`` is the per-problem record. Each ``instance`` here is
+    ``(difficulty, passed, output, code)``.
+    """
+    import json
+
+    graded = [
+        {
+            "question_id": f"q{i}",
+            "difficulty": difficulty,
+            "graded_list": [passed],
+            "output_list": [output],
+            "code_list": [code],
+        }
+        for i, (difficulty, passed, output, code) in enumerate(instances)
+    ]
+    if pass_at_1 is None:
+        pass_at_1 = sum(1 for i in instances if i[1]) / len(instances)
+    detail = {str(i): float(inst[1]) for i, inst in enumerate(instances)}
+
+    eval_file = cell_dir / "Scenario.codegeneration_1_0.0_eval.json"
+    eval_all_file = cell_dir / "Scenario.codegeneration_1_0.0_eval_all.json"
+    eval_file.write_text(
+        json.dumps([{"pass@1": pass_at_1, "detail": {"pass@1": detail}}, {}, []])
+    )
+    eval_all_file.write_text(json.dumps(graded))
+    return eval_file, eval_all_file
+
+
+def test_summarize_lcb_run_reads_pass_at_1_and_difficulties(tmp_path):
+    from reap.lcb import summarize_lcb_run
+
+    eval_file, eval_all_file = _write_lcb_artifacts(
+        tmp_path,
+        [
+            ("easy", True, "sure:\n```python\nprint(1)\n```", "print(1)"),
+            ("easy", True, "sure:\n```python\nprint(2)\n```", "print(2)"),
+            ("medium", False, "sure:\n```python\nprint(3)\n```", "print(3)"),
+            ("hard", False, "sure:\n```python\nprint(4)\n```", "print(4)"),
+        ],
+    )
+
+    summary = summarize_lcb_run(eval_file, eval_all_file)
+
+    assert summary["pass_at_1"] == 0.5
+    assert summary["total_count"] == 4
+    # The per-difficulty split is the point: a mask need not cost the same on
+    # easy and hard problems, and the pooled pass@1 would hide it.
+    assert summary["difficulties"]["easy"] == {"accuracy": 1.0, "num": 2}
+    assert summary["difficulties"]["medium"] == {"accuracy": 0.0, "num": 1}
+    assert summary["failed_requests"] == 0
+    assert summary["no_code_extracted"] == 0
+
+
+def test_summarize_lcb_run_separates_a_dead_request_from_a_codeless_answer(tmp_path):
+    """The two look identical in pass@1 and mean opposite things."""
+    from reap.lcb import summarize_lcb_run
+
+    eval_file, eval_all_file = _write_lcb_artifacts(
+        tmp_path,
+        [
+            ("easy", True, "```python\nprint(1)\n```", "print(1)"),
+            # The request came back empty -- infrastructure, not the model.
+            ("easy", False, "", ""),
+            # The model answered but never emitted a code block -- a real
+            # failure mode for a masked model, and a legitimate zero.
+            ("hard", False, "I think the answer is left as an exercise.", ""),
+        ],
+    )
+
+    summary = summarize_lcb_run(eval_file, eval_all_file)
+
+    assert summary["failed_requests"] == 1
+    assert summary["no_code_extracted"] == 1
+
+
+def test_verify_lcb_summary_rejects_a_cell_with_a_dead_request(tmp_path):
+    """A server hiccup must not be recorded as a low score for that node."""
+    from reap.lcb import summarize_lcb_run, verify_lcb_summary
+
+    eval_file, eval_all_file = _write_lcb_artifacts(
+        tmp_path, [("easy", True, "```python\np\n```", "p"), ("easy", False, "", "")]
+    )
+    summary = summarize_lcb_run(eval_file, eval_all_file)
+
+    with pytest.raises(RuntimeError, match="empty generation"):
+        verify_lcb_summary(summary, expect_n=2)
+
+
+def test_verify_lcb_summary_rejects_a_truncated_run():
+    from reap.lcb import verify_lcb_summary
+
+    summary = {"pass_at_1": 0.5, "total_count": 200, "failed_requests": 0}
+    with pytest.raises(RuntimeError, match="scored 200 problems, expected 454"):
+        verify_lcb_summary(summary, expect_n=454)
+
+    # ...but the check is escapable when a subset is genuinely intended.
+    assert verify_lcb_summary(summary, expect_n=None)["total_count"] == 200
+
+
+def test_verify_lcb_summary_rejects_a_scoreless_run():
+    from reap.lcb import verify_lcb_summary
+
+    with pytest.raises(RuntimeError, match="no pass@1"):
+        verify_lcb_summary({"pass_at_1": None, "total_count": 454})
+
+
+def test_summarize_lcb_run_fails_loud_when_grading_produced_nothing(tmp_path):
+    """The MATH-500/BFCL failure mode again: a cell that ran nothing must not
+    look like a cell that scored zero."""
+    from reap.lcb import summarize_lcb_run
+
+    missing = tmp_path / "Scenario.codegeneration_1_0.0_eval.json"
+    with pytest.raises(RuntimeError, match="wrote no eval file"):
+        summarize_lcb_run(missing, tmp_path / "nope_eval_all.json")
+
+
+def test_summarize_lcb_run_still_scores_without_the_per_problem_file(tmp_path):
+    """`_eval_all.json` carries the difficulty split; its absence costs the
+    breakdown, not the score."""
+    from reap.lcb import summarize_lcb_run
+
+    eval_file, eval_all_file = _write_lcb_artifacts(
+        tmp_path, [("easy", True, "```python\np\n```", "p")]
+    )
+    eval_all_file.unlink()
+
+    summary = summarize_lcb_run(eval_file, eval_all_file)
+
+    assert summary["pass_at_1"] == 1.0
+    assert summary["total_count"] == 1  # recovered from the per-problem detail
+    assert summary["difficulties"] == {}
+
+
+def test_sweep_verify_cell_reads_the_lcb_summary(sweep_mod, tmp_path):
+    """The sweep reads LCB's score off disk, as it does for the other two."""
+    import argparse
+    import json
+
+    from reap.lcb import SUMMARY_FILENAME
+
+    (tmp_path / SUMMARY_FILENAME).write_text(
+        json.dumps(
+            {
+                "pass_at_1": 0.4405,
+                "total_count": 454,
+                "difficulties": {
+                    "easy": {"accuracy": 0.83, "num": 120},
+                    "hard": {"accuracy": 0.12, "num": 160},
+                },
+                "failed_requests": 0,
+                "no_code_extracted": 3,
+            }
         )
+    )
+    args = argparse.Namespace(benchmark="livecodebench", expect_n=454)
+
+    out = sweep_mod._verify_cell(tmp_path, args)
+
+    assert out["score"] == 0.4405
+    assert out["num"] == 454
+    assert out["categories"]["hard"] == 0.12
+    assert out["no_code_extracted"] == 3
+
+
+def test_sweep_verify_cell_fails_on_a_missing_lcb_summary(sweep_mod, tmp_path):
+    import argparse
+
+    args = argparse.Namespace(benchmark="livecodebench", expect_n=0)
+    with pytest.raises(RuntimeError, match="no LiveCodeBench summary"):
+        sweep_mod._verify_cell(tmp_path, args)
+
+
+def test_lcb_concurrency_patch_bounds_requests_in_flight():
+    """Upstream fires every prompt at once; masked cells are exactly the ones
+    that generate to max_tokens, so an unbounded fan-out turns a slow cell into
+    a retry storm against the client-side timeout."""
+    import asyncio
+
+    from lcb_runner.runner.vllm_server_runner import VLLMServerRunner
+
+    from reap.lcb import _patch_bounded_concurrency
+
+    original = VLLMServerRunner.run_batch
+    try:
+        _patch_bounded_concurrency(4)
+
+        peak = 0
+        in_flight = 0
+
+        class FakeRunner:
+            async def _run_single(self, prompt):
+                nonlocal peak, in_flight
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await asyncio.sleep(0)
+                in_flight -= 1
+                return [prompt]
+
+        out = VLLMServerRunner.run_batch(FakeRunner(), [f"p{i}" for i in range(20)])
+
+        assert peak <= 4
+        assert len(out) == 20
+        # Order is preserved, so generations still line up with their problems.
+        assert out[0] == ["p0"] and out[-1] == ["p19"]
+    finally:
+        VLLMServerRunner.run_batch = original
+
+
+def test_lcb_concurrency_patch_survives_being_reused_across_cells():
+    """A semaphore built once would bind to the first event loop and blow up on
+    the second cell -- `lcb_runner` calls `asyncio.run` per batch."""
+    from lcb_runner.runner.vllm_server_runner import VLLMServerRunner
+
+    from reap.lcb import _patch_bounded_concurrency
+
+    original = VLLMServerRunner.run_batch
+    try:
+        _patch_bounded_concurrency(2)
+
+        class FakeRunner:
+            async def _run_single(self, prompt):
+                return [prompt]
+
+        runner = FakeRunner()
+        for _ in range(3):  # three cells, three fresh event loops
+            assert VLLMServerRunner.run_batch(runner, ["a", "b", "c"]) == [
+                ["a"],
+                ["b"],
+                ["c"],
+            ]
+    finally:
+        VLLMServerRunner.run_batch = original
+
+
+# --------------------------------------------------------------------------
+# Paired LiveCodeBench analysis
+#
+# LCB's unpaired noise floor turned out to be ~1.35 pts SD -- 16.5% of problems
+# flip between two *unmasked* runs -- against a 5%-relative bar of ~2.2 pts. So
+# the conclusion rests on the paired statistic in `lcb_paired.py`, and its math
+# has to be right rather than plausible.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def paired_mod():
+    """Load experiments/node-failure/lcb_paired.py by path (not a package)."""
+    import importlib.util
+    import pathlib
+
+    path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "experiments"
+        / "node-failure"
+        / "lcb_paired.py"
+    )
+    spec = importlib.util.spec_from_file_location("lcb_paired", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_exact_mcnemar_matches_the_closed_form(paired_mod):
+    """The exact test, not the chi-square approximation: discordant counts here
+    are often under 25, where the approximation is not safe."""
+    # All flips in one direction: two-sided p = 2 * (1/2)^n.
+    assert paired_mod.exact_mcnemar_p(10, 0) == pytest.approx(2 * 0.5**10)
+    assert paired_mod.exact_mcnemar_p(0, 6) == pytest.approx(2 * 0.5**6)
+    # Symmetric evidence is no evidence, and neither is no evidence at all.
+    assert paired_mod.exact_mcnemar_p(5, 5) == 1.0
+    assert paired_mod.exact_mcnemar_p(0, 0) == 1.0
+    # Direction must not matter to the two-sided p-value.
+    assert paired_mod.exact_mcnemar_p(8, 2) == paired_mod.exact_mcnemar_p(2, 8)
+    # Sanity against a hand-computed value: P(X<=2) for n=10 is 56/1024.
+    assert paired_mod.exact_mcnemar_p(8, 2) == pytest.approx(2 * 56 / 1024)
+    # p is a probability, never above 1, even when the tails overlap.
+    assert paired_mod.exact_mcnemar_p(1, 1) <= 1.0
+
+
+def test_majority_baseline_flags_every_disagreement(paired_mod):
+    """The unstable set is the harness's own flip rate; missing one would
+    overstate how much a node moved."""
+    reps = [
+        {"a": True, "b": False, "c": True},
+        {"a": True, "b": True, "c": True},
+        {"a": False, "b": True, "c": True},
+    ]
+    reference, unstable = paired_mod.majority_baseline(reps)
+
+    assert reference == {"a": True, "b": True, "c": True}  # 2-of-3 each
+    assert unstable == {"a", "b"}  # 'c' agreed three times, so it is stable
+
+
+def test_majority_baseline_uses_only_problems_every_repeat_scored(paired_mod):
+    """A problem missing from one repeat cannot be majority-voted."""
+    reps = [{"a": True, "b": True}, {"a": True}]
+    reference, _ = paired_mod.majority_baseline(reps)
+    assert set(reference) == {"a"}
+
+
+def test_loo_null_holds_out_the_run_being_tested(paired_mod):
+    """A majority that includes the run under test agrees with it by
+    construction, which would understate the flip rate and make every node look
+    significant."""
+    # rep 0 disagrees with reps 1 and 2 on 'a'; they agree with each other.
+    reps = [
+        {"a": False, "b": True},
+        {"a": True, "b": True},
+        {"a": True, "b": True},
+    ]
+    rows = paired_mod.loo_null(reps, ["a", "b"])
+
+    assert [row["rep"] for row in rows] == [0, 1, 2]
+    # Held out rep 0: reference says 'a' passes, rep 0 fails it -> one loss.
+    assert rows[0]["pass_to_fail"] == 1
+    assert rows[0]["fail_to_pass"] == 0
+    assert rows[0]["net_problems"] == -1
+    # Held out rep 1: the others (0 and 2) disagree on 'a', so it has no
+    # majority and is excluded -- only 'b' is comparable.
+    assert rows[1]["n"] == 1
+    assert rows[1]["net_problems"] == 0
+
+
+def test_loo_null_needs_three_repeats(paired_mod):
+    """With two repeats, leaving one out leaves no majority to compare to."""
+    assert paired_mod.loo_null([{"a": True}, {"a": False}], ["a"]) == []
+
+
+def test_load_grades_treats_any_passing_sample_as_a_pass(paired_mod, tmp_path):
+    """pass@1 at n=1 is one sample, but the record is a list; reading only the
+    first element would silently mis-score an n>1 run."""
+    import json
+
+    (tmp_path / "Scenario.codegeneration_1_0.0_eval_all.json").write_text(
+        json.dumps(
+            [
+                {"question_id": "q1", "graded_list": [False, True], "difficulty": "easy"},
+                {"question_id": "q2", "graded_list": [False], "difficulty": "hard"},
+                {"question_id": "q3", "graded_list": [], "difficulty": "hard"},
+            ]
+        )
+    )
+
+    grades = paired_mod.load_grades(tmp_path)
+
+    assert grades == {"q1": True, "q2": False, "q3": False}
+    assert paired_mod.load_difficulties(tmp_path)["q2"] == "hard"
+
+
+def test_load_grades_fails_loud_on_an_ungraded_cell(paired_mod, tmp_path):
+    with pytest.raises(FileNotFoundError, match="eval_all"):
+        paired_mod.load_grades(tmp_path)
+
+
+def test_failure_modes_parses_lcbs_json_strings(paired_mod, tmp_path):
+    """LCB stores each metadata entry as a JSON *string* inside a list. Reading
+    it as a dict finds nothing and quietly concludes "no timeouts", which is how
+    a load-sensitivity confound would go unnoticed."""
+    import json
+
+    (tmp_path / "Scenario.codegeneration_1_0.0_eval_all.json").write_text(
+        json.dumps(
+            [
+                {"question_id": "p", "graded_list": [True], "metadata": []},
+                {
+                    "question_id": "tle",
+                    "graded_list": [False],
+                    "metadata": [json.dumps({"error_message": "Time Limit Exceeded"})],
+                },
+                {
+                    "question_id": "trunc",
+                    "graded_list": [False],
+                    "metadata": [
+                        json.dumps(
+                            {"error_message": "Error during testing: expected an indent"}
+                        )
+                    ],
+                },
+                {
+                    "question_id": "wrong",
+                    "graded_list": [False],
+                    "metadata": [json.dumps({"error_message": "Wrong Answer"})],
+                },
+                {
+                    "question_id": "rt",
+                    "graded_list": [False],
+                    "metadata": [json.dumps({"error": "Runtime Error"})],
+                },
+                # Already-parsed dicts must work too, and an unparseable entry
+                # must not take the whole cell down.
+                {
+                    "question_id": "dict",
+                    "graded_list": [False],
+                    "metadata": [{"error_message": "Wrong answer at output_line_idx=0"}],
+                },
+                {"question_id": "junk", "graded_list": [False], "metadata": ["{not json"]},
+            ]
+        )
+    )
+
+    counts = paired_mod.failure_modes(tmp_path)
+
+    assert counts["pass"] == 1
+    assert counts["time_limit"] == 1
+    assert counts["truncated"] == 1
+    assert counts["wrong_answer"] == 2  # the JSON string and the plain dict
+    assert counts["runtime"] == 1
+    assert counts["no_message"] == 1  # unparseable metadata, not a crash
+
+
+def test_majority_returns_none_on_a_tie(paired_mod):
+    """An even split resolved to `fail` drags the reference below every single
+    run: measured at 6 repeats, majority 0.3987 against a per-run range of
+    0.4141-0.4405, which flatters every masked cell compared against it."""
+    assert paired_mod.majority([True, True, False]) is True
+    assert paired_mod.majority([True, False, False]) is False
+    assert paired_mod.majority([True, False]) is None
+    assert paired_mod.majority([True, True, True, False, False, False]) is None
+    assert paired_mod.majority([True, True, True, True, False, False]) is True
+
+
+def test_majority_baseline_excludes_ties_at_even_repeat_counts(paired_mod):
+    """With 6 repeats the reference must not silently gain a downward bias."""
+    reps = [
+        {"tie": True, "clear": True},
+        {"tie": True, "clear": True},
+        {"tie": True, "clear": True},
+        {"tie": False, "clear": True},
+        {"tie": False, "clear": True},
+        {"tie": False, "clear": False},
+    ]
+    reference, unstable = paired_mod.majority_baseline(reps)
+
+    assert "tie" not in reference  # 3-3 carries no verdict, so it is dropped
+    assert reference == {"clear": True}
+    # It is still counted as unstable: it is part of the harness's flip rate.
+    assert unstable == {"tie", "clear"}
+
+
+def test_loo_null_uses_a_majority_of_the_others_not_unanimity(paired_mod):
+    """Requiring the held-out set to agree unanimously keeps only the easy,
+    stable problems, which makes the null non-comparable to the per-node rows
+    it exists to calibrate."""
+    # 5 others, split 3-2 on 'q': a majority exists, so 'q' must be compared.
+    reps = [
+        {"q": True},
+        {"q": True},
+        {"q": True},
+        {"q": True},
+        {"q": False},
+        {"q": False},
+    ]
+    rows = paired_mod.loo_null(reps, ["q"])
+
+    # Holding out rep 0 leaves 3 pass / 2 fail -> reference passes, and the
+    # held-out run passes too, so it is compared and concordant.
+    assert rows[0]["n"] == 1
+    assert rows[0]["net_problems"] == 0
+    # Holding out rep 4 (a fail) leaves 4 pass / 1 fail -> reference passes and
+    # the held-out run disagrees: one loss.
+    assert rows[4]["n"] == 1
+    assert rows[4]["pass_to_fail"] == 1

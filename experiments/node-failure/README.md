@@ -16,8 +16,11 @@ per-token failure statistics are identical — `1 - (1 - 1/32)^8 = 22.4%` of tok
 least one expert. Qwen3-30B-A3B is a faithful and far cheaper stand-in for the K2.6
 experiment; GLM-4.5-Air combines Qwen3's expert count with K2.6's exact routing path
 (`grouped_topk` + sigmoid + correction bias) and adds K2.6's shared expert, making it the
-closer proxy of the two. It is swept on **BFCL** rather than MATH-500 —
-see [GLM45-AIR-BFCL.md](./GLM45-AIR-BFCL.md).
+closer proxy of the two. It is swept on **BFCL** — see
+[GLM45-AIR-BFCL.md](./GLM45-AIR-BFCL.md) — and on **LiveCodeBench** — see
+[GLM45-AIR-LCB.md](./GLM45-AIR-LCB.md), which is the only one of the three
+benchmarks to show a measurable aggregate effect (−3.9% relative, −6.1σ) and
+which needed a paired per-problem analysis to see it at all.
 
 See [PLAN.md](./PLAN.md) for the design rationale, cost model and fidelity caveats.
 
@@ -27,7 +30,7 @@ See [PLAN.md](./PLAN.md) for the design rationale, cost model and fidelity cavea
 |---|---|---|
 | [`src/reap/expert_failure.py`](../../src/reap/expert_failure.py) | new | The routing mask. Patches `FusedMoE.select_experts`; implements the three semantics; tracks routing counters. |
 | [`src/reap/expert_failure_server.py`](../../src/reap/expert_failure_server.py) | new | vLLM OpenAI server + `GET/POST /reap/failure` control plane, so the mask changes without a restart. |
-| [`sweep.py`](./sweep.py) | new | Resumable, sharded driver over (mode × node) cells. `--benchmark math_500|bfcl`. |
+| [`sweep.py`](./sweep.py) | new | Resumable, sharded driver over (mode × node) cells. `--benchmark math_500|bfcl|livecodebench`. |
 | [`report.py`](./report.py) | new | Per-node delta against the measured baseline, in sigma. |
 | [`heatmap.py`](./heatmap.py) | new | The sweep as a grid heatmap of the EP expert layout, light + dark. |
 | [`BFCL-RUNBOOK.md`](./BFCL-RUNBOOK.md) | new | **How to run BFCL**, standalone or in the sweep. Start here for BFCL. |
@@ -35,10 +38,15 @@ See [PLAN.md](./PLAN.md) for the design rationale, cost model and fidelity cavea
 | [`src/reap/bfcl.py`](../../src/reap/bfcl.py) | new | Runs BFCL against the live server, in its own interpreter. |
 | [`src/reap/bfcl_client/`](../../src/reap/bfcl_client/) | new | The BFCL-side client: model registration + prompting handler. |
 | [`GLM45-AIR-BFCL.md`](./GLM45-AIR-BFCL.md) | new | The GLM-4.5-Air / BFCL sweep: topology, serving, wiring, results. |
-| [`tests/test_expert_failure.py`](../../tests/test_expert_failure.py) | new | 57 tests of the masking math against the real vLLM router, on **all three** routing profiles, plus the result readers. No weights needed. |
+| [`LCB-RUNBOOK.md`](./LCB-RUNBOOK.md) | new | **How to run LiveCodeBench**, standalone or in the sweep. Start here for LCB. |
+| [`src/reap/lcb.py`](../../src/reap/lcb.py) | new | Runs LiveCodeBench against the live server: bounded concurrency, score extraction, completeness guards. |
+| [`lcb_paired.py`](./lcb_paired.py) | new | Paired per-problem analysis: exact McNemar, leave-one-out null, failure-mode decomposition. LCB's noise floor makes the unpaired view useless. |
+| [`GLM45-AIR-LCB.md`](./GLM45-AIR-LCB.md) | new | The GLM-4.5-Air / LiveCodeBench sweep: wiring, statistics, results, and how to reproduce it. |
+| [`tests/test_expert_failure.py`](../../tests/test_expert_failure.py) | new | 80 tests of the masking math against the real vLLM router, on **all three** routing profiles, plus the result readers. No weights needed. |
 | [`pyproject.toml`](../../pyproject.toml) | +3 lines | Registers the `expert_failure` plugin entry point. |
-| [`src/reap/args.py`](../../src/reap/args.py) | +8 fields | `EvalArgs.existing_server_url`, `.math_tasks`, `.strict`, and the `run_bfcl` / `bfcl_*` group. |
-| [`src/reap/eval.py`](../../src/reap/eval.py) | ~50 lines | Honour those fields, and dispatch to BFCL. No behaviour change when unset. |
+| [`src/reap/args.py`](../../src/reap/args.py) | +17 fields | `EvalArgs.existing_server_url`, `.math_tasks`, `.strict`, and the `run_bfcl` / `bfcl_*` and `lcb_*` groups. |
+| [`src/reap/eval.py`](../../src/reap/eval.py) | ~90 lines | Honour those fields, and dispatch to BFCL / LiveCodeBench. No behaviour change when unset. |
+| [`launch_sweep.sh`](./launch_sweep.sh) | +`TP`, `BENCHMARK` | One server per TP group, so a model needing TP=2 no longer needs hand-written server loops. |
 
 ## How it works
 

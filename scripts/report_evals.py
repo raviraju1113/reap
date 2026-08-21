@@ -102,7 +102,18 @@ def process_eval_directory(eval_dir, parent_path):
     humaneval_path = eval_dir / "humaneval.json"
     mbpp_path = eval_dir / "mbpp.json"
     lm_eval_path = eval_dir / "lm_eval_results.json"
-    livecodebench_path = eval_dir / "Scenario.codegeneration_1_0.2_eval.json"
+    # The filename encodes the sampling temperature, which is 0.0 for a greedy
+    # run and 0.2 for the historical sampled one, so match either.
+    livecodebench_candidates = sorted(
+        path
+        for path in eval_dir.glob("Scenario.codegeneration_*_eval.json")
+        if not path.name.endswith("_eval_all.json")
+    )
+    livecodebench_path = (
+        livecodebench_candidates[0]
+        if livecodebench_candidates
+        else eval_dir / "Scenario.codegeneration_1_0.2_eval.json"
+    )
 
     # check degenerate outputs
 

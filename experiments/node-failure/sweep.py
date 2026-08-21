@@ -5,7 +5,7 @@ setting the dead-expert mask between cells over the ``/reap/failure`` control
 plane exposed by ``reap.expert_failure_server``. That is what makes the sweep
 affordable: a 32-node sweep costs one checkpoint load rather than 32.
 
-Two benchmarks are supported, selected with ``--benchmark``:
+Three benchmarks are supported, selected with ``--benchmark``:
 
 ``math_500``
     evalscope MATH-500, 500 problems. The original Qwen3-30B-A3B sweep.
@@ -13,6 +13,10 @@ Two benchmarks are supported, selected with ``--benchmark``:
     Berkeley Function-Calling Leaderboard, ``non_live`` by default: 1390
     entries across 7 categories. Runs in a separate interpreter -- see
     ``reap.bfcl``.
+``livecodebench``
+    LiveCodeBench code generation, pass@1 over the 2024-08-01..2025-07-31
+    contest window by default: 454 problems. Runs in this interpreter and
+    grades by executing the generated programs -- see ``reap.lcb``.
 
 The two models swept with this driver both have 128 routed experts at top-8, so
 32 nodes means 4 dead experts per node either way (K2.6, the original target, is
@@ -69,6 +73,15 @@ GLM-4.5-Air on BFCL, 4 shards of TP=2::
           --shard $i --num-shards 4 --baseline-repeats 2 &
     done
 
+Same layout on LiveCodeBench -- identical except for ``--benchmark``, since the
+runner drives the same server over the same OpenAI endpoint::
+
+    for i in 0 1 2 3; do
+      python experiments/node-failure/sweep.py --model $MODEL \\
+          --port $((8000+i)) --benchmark livecodebench --modes reroute \\
+          --shard $i --num-shards 4 --baseline-repeats 3 &
+    done
+
 Results land in ``<results-dir>/<mode>/node_<k>/`` with a ``cell.json`` holding
 the score and the routing counters. The driver is resumable: a cell whose
 ``cell.json`` exists is skipped, so an interrupted sweep restarts where it
@@ -91,6 +104,15 @@ import requests
 from reap.args import EvalArgs, ModelArgs
 from reap.bfcl import EXPECTED_NON_LIVE_N, verify_bfcl_summary
 from reap.eval import run_evaluate
+from reap.lcb import (
+    DEFAULT_END_DATE,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_RELEASE_VERSION,
+    DEFAULT_START_DATE,
+    EXPECTED_N_BY_WINDOW,
+    SUMMARY_FILENAME as LCB_SUMMARY_FILENAME,
+    verify_lcb_summary,
+)
 from reap.expert_failure import DEFAULT_NUM_EXPERTS, DEFAULT_NUM_NODES, experts_for_node
 
 logger = logging.getLogger("node-failure-sweep")
@@ -156,8 +178,30 @@ EXPECTED_MATH500_N = 500
 # Per-benchmark default for --expect-n, the "did this cell really run the whole
 # benchmark?" guard. A cell that scored fewer problems than the baseline is not
 # comparable to it, so a short run is an error rather than a datapoint.
-BENCHMARKS = ("math_500", "bfcl")
+BENCHMARKS = ("math_500", "bfcl", "livecodebench")
 DEFAULT_EXPECT_N = {"math_500": EXPECTED_MATH500_N, "bfcl": EXPECTED_NON_LIVE_N}
+
+
+def default_expect_n(args: argparse.Namespace) -> int:
+    """The full size of the selected benchmark, or 0 when it cannot be known.
+
+    LiveCodeBench's size is a function of the contest window rather than a
+    constant, and a window this repo has not measured has no expected count --
+    in which case the guard is disabled rather than guessed at.
+    """
+    if args.benchmark != "livecodebench":
+        return DEFAULT_EXPECT_N[args.benchmark]
+    window = (args.lcb_start_date, args.lcb_end_date)
+    expected = EXPECTED_N_BY_WINDOW.get(window)
+    if expected is None:
+        logger.warning(
+            "no measured problem count for the LiveCodeBench window %s..%s, so "
+            "the completeness check is off. Pass --expect-n <count> to restore "
+            "it once the first cell reports its count.",
+            *window,
+        )
+        return 0
+    return expected
 
 
 def read_evalscope_report(cell_dir: pathlib.Path, task: str) -> dict:
@@ -218,8 +262,10 @@ def _eval_args_for(args: argparse.Namespace, base_url: str) -> EvalArgs:
         existing_server_url=base_url,
         run_lm_eval=False,
         run_evalplus=False,
-        run_livecodebench=False,
         run_wildbench=False,
+        run_math=False,
+        run_bfcl=False,
+        run_livecodebench=False,
         strict=True,
         greedy=True,
         vllm_port=args.port,
@@ -227,21 +273,29 @@ def _eval_args_for(args: argparse.Namespace, base_url: str) -> EvalArgs:
     )
     if args.benchmark == "math_500":
         return EvalArgs(
-            **common,
-            run_math=True,
-            run_bfcl=False,
+            **{**common, "run_math": True},
             # The default is gsm8k+math_500, which would add 1319 problems per
             # cell for a benchmark this sweep does not report.
             math_tasks=["math_500"],
         )
+    if args.benchmark == "bfcl":
+        return EvalArgs(
+            **{**common, "run_bfcl": True},
+            bfcl_test_categories=list(args.bfcl_test_category),
+            bfcl_num_threads=args.bfcl_num_threads,
+            bfcl_enable_thinking=args.bfcl_enable_thinking,
+            bfcl_python=args.bfcl_python,
+        )
     return EvalArgs(
-        **common,
-        run_math=False,
-        run_bfcl=True,
-        bfcl_test_categories=list(args.bfcl_test_category),
-        bfcl_num_threads=args.bfcl_num_threads,
-        bfcl_enable_thinking=args.bfcl_enable_thinking,
-        bfcl_python=args.bfcl_python,
+        **{**common, "run_livecodebench": True},
+        lcb_release_version=args.lcb_release_version,
+        lcb_start_date=args.lcb_start_date,
+        lcb_end_date=args.lcb_end_date,
+        lcb_max_tokens=args.lcb_max_tokens,
+        lcb_num_threads=args.lcb_num_threads,
+        lcb_num_process_evaluate=args.lcb_num_process_evaluate,
+        lcb_timeout=args.lcb_timeout,
+        lcb_enable_thinking=args.lcb_enable_thinking,
     )
 
 
@@ -257,6 +311,32 @@ def _verify_cell(cell_dir: pathlib.Path, args: argparse.Namespace) -> dict:
     if args.benchmark == "math_500":
         result = _verify_math500(cell_dir, args.expect_n)
         return {"score": result["score"], "num": result["num"], "report": result["report"]}
+
+    if args.benchmark == "livecodebench":
+        summary_path = cell_dir / LCB_SUMMARY_FILENAME
+        if not summary_path.exists():
+            raise RuntimeError(
+                f"no LiveCodeBench summary at {summary_path}. The benchmark did "
+                f"not run to completion; check this shard's log."
+            )
+        summary = json.loads(summary_path.read_text())
+        verify_lcb_summary(summary, args.expect_n or None)
+        return {
+            "score": summary["pass_at_1"],
+            "num": summary["total_count"],
+            "report": str(summary_path),
+            # Difficulty is LiveCodeBench's analogue of BFCL's categories: a
+            # routing perturbation need not cost the same on easy and hard
+            # problems, and the pooled pass@1 would hide it.
+            "categories": {
+                name: (value or {}).get("accuracy")
+                for name, value in (summary.get("difficulties") or {}).items()
+            },
+            # Kept on the record because a non-empty answer with no code block
+            # is a failure mode masking can plausibly cause, and it is invisible
+            # in pass@1 alone.
+            "no_code_extracted": summary.get("no_code_extracted"),
+        }
 
     summary_path = cell_dir / "bfcl" / "bfcl_summary.json"
     if not summary_path.exists():
@@ -489,9 +569,11 @@ def main() -> int:
         "--benchmark",
         default="math_500",
         choices=BENCHMARKS,
-        help="`math_500` (evalscope, 500 problems) or `bfcl` (Berkeley "
-        "Function-Calling Leaderboard, 1390 non-live entries). BFCL runs in a "
-        "separate interpreter; see reap.bfcl for the one-time setup.",
+        help="`math_500` (evalscope, 500 problems), `bfcl` (Berkeley "
+        "Function-Calling Leaderboard, 1390 non-live entries) or "
+        "`livecodebench` (code generation pass@1, 454 problems over the "
+        "default contest window). BFCL runs in a separate interpreter; see "
+        "reap.bfcl for the one-time setup.",
     )
     p.add_argument(
         "--bfcl-test-category",
@@ -520,6 +602,49 @@ def main() -> int:
         help="interpreter with bfcl_eval installed (default .venv-bfcl/bin/python)",
     )
     p.add_argument(
+        "--lcb-release-version",
+        default=DEFAULT_RELEASE_VERSION,
+        help="LiveCodeBench `code_generation_lite` release tag",
+    )
+    p.add_argument(
+        "--lcb-start-date",
+        default=DEFAULT_START_DATE,
+        help="earliest contest date, YYYY-MM-DD. With --lcb-end-date this fixes "
+        "the problem count and so the noise floor: the default window is 454 "
+        "problems, `2025-01-01` onwards is 182.",
+    )
+    p.add_argument("--lcb-end-date", default=DEFAULT_END_DATE, help="latest contest date")
+    p.add_argument(
+        "--lcb-max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="generation ceiling per problem; bounds how long a degenerate "
+        "generation under a mask can run",
+    )
+    p.add_argument(
+        "--lcb-num-threads",
+        type=int,
+        default=32,
+        help="concurrent LiveCodeBench requests; keep at or below the server's "
+        "--max-num-seqs",
+    )
+    p.add_argument(
+        "--lcb-num-process-evaluate",
+        type=int,
+        default=12,
+        help="grading worker processes. Grading runs the generated programs, so "
+        "these execute untrusted code.",
+    )
+    p.add_argument(
+        "--lcb-timeout", type=int, default=120, help="per-test grading timeout, seconds"
+    )
+    p.add_argument(
+        "--lcb-enable-thinking",
+        action="store_true",
+        help="leave GLM reasoning mode on. Off by default, matching the BFCL "
+        "sweep; must be identical across baseline and masked cells either way.",
+    )
+    p.add_argument(
         "--baseline-repeats",
         type=int,
         default=2,
@@ -543,8 +668,9 @@ def main() -> int:
         default=None,
         help="fail a cell whose report does not cover this many problems "
         "(0 disables). Defaults to the benchmark's full size -- 500 for "
-        "MATH-500, 1390 for BFCL non-live. Guards against a truncated run being "
-        "compared to a full baseline.",
+        "MATH-500, 1390 for BFCL non-live, and for LiveCodeBench whatever the "
+        "selected contest window holds (454 for the default one). Guards "
+        "against a truncated run being compared to a full baseline.",
     )
     p.add_argument(
         "--preflight",
@@ -561,7 +687,7 @@ def main() -> int:
     if args.preflight_only:
         args.preflight = True
     if args.expect_n is None:
-        args.expect_n = DEFAULT_EXPECT_N[args.benchmark]
+        args.expect_n = default_expect_n(args)
 
     if args.benchmark == "bfcl":
         # Fail here rather than after the first cell's generation pass: the
@@ -569,6 +695,25 @@ def main() -> int:
         from reap.bfcl import resolve_bfcl_python
 
         logger.info("BFCL interpreter: %s", resolve_bfcl_python(args.bfcl_python))
+
+    if args.benchmark == "livecodebench":
+        # Both of these fail late and confusingly otherwise: an unregistered
+        # model raises KeyError from inside lcb_main, and a dataset that will
+        # not load does so after the first cell has set its mask.
+        from lcb_runner.lm_styles import LanguageModelStore
+
+        from reap.eval import get_original_model_name
+
+        hf_name, _ = get_original_model_name(args.model)
+        if hf_name not in LanguageModelStore:
+            raise SystemExit(
+                f"'{hf_name}' is not registered in lcb_runner's "
+                f"LanguageModelStore, so LiveCodeBench cannot pick a prompt "
+                f"format or a runner for it. Add a LanguageModel entry with "
+                f"LMStyle.ReapBase in "
+                f"third-party/LiveCodeBench/lcb_runner/lm_styles.py."
+            )
+        logger.info("LiveCodeBench model entry: %s -> %s", args.model, hf_name)
 
     if not 0 <= args.shard < args.num_shards:
         raise SystemExit(f"--shard must be in [0, {args.num_shards}), got {args.shard}")

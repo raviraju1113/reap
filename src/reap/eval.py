@@ -322,30 +322,41 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 raise ValueError(
                     "Current LCB ReapBase model style implementation requries a vLLM server to be running"
                 )
-            from lcb_runner.runner.main import main as lcb_main
-            from lcb_runner.runner.main import get_args_dict
+            from reap.lcb import run_livecodebench
 
             original_model, uncompressed_model = get_original_model_name(model_name)
 
-            lcb_args = get_args_dict(
-                model=original_model,
-                n=1,
-                output_path=results_dir,
-                enable_thinking=False,
-                base_url=f"{server_endpoint}/v1",
-                start_date="2025-01-01",
-                end_date="2025-07-31",
-                evaluate=True,
-                timeout=120,
+            run_livecodebench(
+                hf_model_name=original_model,
+                # The served-model-name, which must match exactly -- vLLM
+                # compares literally, so a trailing slash 404s every request.
                 local_model_path=model_name if not uncompressed_model else None,
-                max_tokens=16384,
+                results_dir=results_dir,
+                server_url=server_endpoint,
+                release_version=getattr(
+                    eval_args, "lcb_release_version", "release_latest"
+                ),
+                start_date=getattr(eval_args, "lcb_start_date", "2024-08-01"),
+                end_date=getattr(eval_args, "lcb_end_date", "2025-07-31"),
+                n=getattr(eval_args, "lcb_n", 1),
+                # Greedy means the only run-to-run variation is vLLM's own
+                # batching nondeterminism, which is what makes a small per-cell
+                # delta interpretable at all.
+                temperature=0.0 if eval_args.greedy else eval_args.temperature,
+                top_p=1.0 if eval_args.greedy else eval_args.top_p,
+                max_tokens=getattr(eval_args, "lcb_max_tokens", 16384),
+                num_threads=getattr(eval_args, "lcb_num_threads", 32),
+                num_process_evaluate=getattr(eval_args, "lcb_num_process_evaluate", 12),
+                timeout=getattr(eval_args, "lcb_timeout", 120),
+                enable_thinking=getattr(eval_args, "lcb_enable_thinking", False),
             )
-            logger.info(f"Running LiveCodeBench with args: {lcb_args}")
-            lcb_main(lcb_args)
             logger.info(f"Finished evaluating LiveCodeBench")
     except Exception as e:
         logger.error(f"An error occurred during livecodebench: {e}")
-        pass
+        # As with the math and BFCL paths: swallowing by default keeps one bad
+        # benchmark from aborting a suite, but a sweep needs the opposite.
+        if getattr(eval_args, "strict", False):
+            raise
     try:
         if eval_args.run_wildbench:
             from helm.benchmark.run import helm_run, create_helm_run_args
